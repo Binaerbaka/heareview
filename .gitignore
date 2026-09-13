@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+
+# 虚拟环境
+.venv/
+.venv*/
+venv/
+env/
+
+# 录音与字幕（本地数据，不上传 GitHub）
+recordings/
+transcripts/
+*.wav
+
+# 临时文件
+*.tmp
+*.log
