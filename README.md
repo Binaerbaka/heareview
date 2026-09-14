@@ -5,9 +5,10 @@
 ## 功能
 
 - 实时采集麦克风音频
-- WebRTC VAD 检测讲话与停顿，按“一句一条”切分语音
-- 检测到约 0.7 秒停顿后，把完整句子交给 Whisper 识别
-- 识别结果固定向下追加，输出带时间戳的字幕（Markdown）
+- 流式识别（LocalAgreement-2）：每约 0.8 秒重新识别未确认音频
+- 连续两轮识别相同的前缀单词立即确认为字幕
+- 不依赖停顿分句，连续讲话时也能持续输出
+- 识别结果带时间戳向下追加（Markdown）
 - 同时保存完整课堂录音（WAV）
 - 录音与识别分线程运行，识别期间不丢失声音
 
@@ -18,16 +19,12 @@
   - `numpy`
   - `sounddevice`
   - `faster-whisper`
-  - `webrtcvad`（Python 3.13 请用预编译轮子 `webrtcvad-wheels`）
 
 安装依赖：
 
 ```bash
 pip install numpy sounddevice faster-whisper
-pip install webrtcvad-wheels
 ```
-
-> 注意：直接安装 `webrtcvad` 在 Python 3.13 上会因缺少 MSVC 编译失败，使用 `webrtcvad-wheels` 即可提供同名 `webrtcvad` 模块。
 
 ## 使用方法
 

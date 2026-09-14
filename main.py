@@ -1,118 +1,328 @@
 """
-HearReview v0.3.1 - Sentence-based live captions
+HearReview v0.4 - LocalAgreement streaming captions
 
-运行逻辑：
-1. 持续监听麦克风并保存完整 WAV。
-2. WebRTC VAD 判断老师是否正在讲话。
-3. 检测到约0.7秒停顿后，认为当前语句结束。
-4. 将完整语句交给 Whisper。
-5. 识别完成后固定输出并向下追加。
-6. 录音和识别使用不同线程，避免识别期间丢失声音。
-
-目标：
-老师讲完一句话后约3秒内输出稳定字幕。
+核心逻辑：
+1. 麦克风持续采集音频，同时保存完整 WAV。
+2. 每当积累约0.8秒新音频，重新识别尚未确认的音频缓冲区。
+3. 比较本轮和上一轮识别结果。
+4. 连续两轮都相同的前缀单词被视为“已确认”。
+5. 已确认文字立即向下输出并写入 Markdown。
+6. 尚未确认的末尾文字留到下一轮继续判断。
+7. 不依赖老师停顿，因此连续讲话时仍能不断输出。
 
 当前默认：
-Desktop 运行、CPU 推理、base.en 模型。
-CUDA环境完成后，可以再切换到GPU。
+- 运行设备：Desktop
+- 模型：base.en
+- 推理：CPU int8
+
+如果之后完成 CUDA 配置，只需修改模型配置，不必重写流式算法。
 """
 
 from __future__ import annotations
 
 import queue
+import re
 import tempfile
 import threading
 import time
 import wave
-from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 import sounddevice as sd
-import webrtcvad
 from faster_whisper import WhisperModel
 
 
-# -------------------- 音频配置 --------------------
+# -------------------- 基础配置 --------------------
 
 SAMPLE_RATE = 16_000
+CHANNELS = 1
 
-# WebRTC VAD 只接受10、20或30毫秒的音频帧。
-FRAME_DURATION_MS = 30
-FRAME_SAMPLES = int(
-    SAMPLE_RATE * FRAME_DURATION_MS / 1000
+# 麦克风每次回调提供100毫秒音频。
+CALLBACK_BLOCK_SECONDS = 0.1
+CALLBACK_BLOCK_SAMPLES = int(
+    SAMPLE_RATE * CALLBACK_BLOCK_SECONDS
 )
 
-# 检测到0.7秒静音后，认为老师讲完一句话。
-SILENCE_TO_FINISH_SECONDS = 0.7
-SILENCE_FRAMES_TO_FINISH = int(
-    SILENCE_TO_FINISH_SECONDS * 1000 /
-    FRAME_DURATION_MS
-)
+# 每增加约0.8秒音频，执行一次流式识别。
+UPDATE_INTERVAL_SECONDS = 0.8
 
-# 保存语音开始前0.3秒，避免切掉句首。
-PRE_ROLL_SECONDS = 0.3
-PRE_ROLL_FRAMES = int(
-    PRE_ROLL_SECONDS * 1000 /
-    FRAME_DURATION_MS
-)
+# 音频不足1秒时不开始识别。
+MINIMUM_BUFFER_SECONDS = 1.0
 
-# 小于0.3秒的语音通常是咳嗽、碰撞声或误检测。
-MIN_SPEECH_SECONDS = 0.3
-MIN_SPEECH_FRAMES = int(
-    MIN_SPEECH_SECONDS * 1000 /
-    FRAME_DURATION_MS
-)
+# 如果长期无法确认任何文字，缓冲超过25秒时启用保护性提交，
+# 防止一堂长课中内存不断增加。
+MAXIMUM_BUFFER_SECONDS = 25.0
 
-# 老师如果连续讲话完全不停顿，20秒后强制切段。
-MAX_UTTERANCE_SECONDS = 20
-MAX_UTTERANCE_FRAMES = int(
-    MAX_UTTERANCE_SECONDS * 1000 /
-    FRAME_DURATION_MS
-)
+# 保护性提交时保留末尾3秒，不强制确认。
+FORCED_KEEP_SECONDS = 3.0
 
 
-# -------------------- Whisper配置 --------------------
+# -------------------- 模型配置 --------------------
 
 MODEL_NAME = "base.en"
 INFERENCE_DEVICE = "cpu"
 COMPUTE_TYPE = "int8"
 
+COURSE_PROMPT = (
+    "This is an English university lecture. "
+    "Possible topics include electronic engineering, mathematics, "
+    "physics, programming, circuits, signals, systems, robotics, "
+    "algorithms and artificial intelligence."
+)
 
-# 麦克风回调和主线程之间的音频队列。
-audio_queue: queue.Queue[bytes] = queue.Queue()
 
-# 完整语句等待 Whisper 识别的队列。
-transcription_queue: queue.Queue[
-    "TranscriptionTask | None"
-] = queue.Queue()
+# 麦克风回调只负责把音频放进队列。
+audio_queue: queue.Queue[np.ndarray] = queue.Queue()
+
+# 通知识别线程结束。
+stop_event = threading.Event()
 
 
 @dataclass
-class TranscriptionTask:
+class WordToken:
     """
-    一条等待识别的完整语音。
+    Whisper返回的一个单词。
 
-    audio_bytes:
-        16 kHz、单声道、16位 PCM 数据。
-
-    start_time/end_time:
-        语句在整堂录音中的时间位置。
+    start和end是相对于当前未确认音频缓冲区的时间。
     """
 
-    audio_bytes: bytes
-    start_time: float
-    end_time: float
+    text: str
+    start: float
+    end: float
+
+
+class StreamingAudioBuffer:
+    """
+    保存尚未确认的音频。
+
+    主线程不断追加麦克风音频；
+    识别线程确认文字后，从缓冲区前端删除对应音频。
+    """
+
+    def __init__(self):
+        self._audio = np.empty(
+            0,
+            dtype=np.float32
+        )
+
+        # 当前缓冲区开头在整堂课中的绝对时间。
+        self._start_time = 0.0
+
+        self._lock = threading.Lock()
+
+    def append(self, audio: np.ndarray):
+        """加入新录制的音频。"""
+        with self._lock:
+            self._audio = np.concatenate([
+                self._audio,
+                audio
+            ])
+
+    def snapshot(
+        self
+    ) -> tuple[np.ndarray, float]:
+        """
+        返回当前音频副本和绝对开始时间。
+
+        Whisper推理使用副本，避免推理期间阻塞录音。
+        """
+        with self._lock:
+            return (
+                self._audio.copy(),
+                self._start_time
+            )
+
+    def trim(self, seconds: float):
+        """
+        删除已经确认的前端音频。
+
+        seconds是相对于当前缓冲区开头的时间。
+        """
+        samples = int(seconds * SAMPLE_RATE)
+
+        if samples <= 0:
+            return
+
+        with self._lock:
+            samples = min(
+                samples,
+                len(self._audio)
+            )
+
+            self._audio = self._audio[
+                samples:
+            ].copy()
+
+            self._start_time += (
+                samples / SAMPLE_RATE
+            )
+
+
+def audio_callback(
+    indata,
+    frames,
+    time_info,
+    status
+):
+    """
+    麦克风回调函数。
+
+    回调中不运行Whisper，避免推理导致麦克风丢帧。
+    """
+    if status:
+        print(
+            f"\n录音警告：{status}",
+            flush=True
+        )
+
+    audio_queue.put(
+        indata[:, 0].copy()
+    )
+
+
+def float_to_pcm16(
+    audio: np.ndarray
+) -> np.ndarray:
+    """将float32音频转换成16位PCM，用于保存WAV。"""
+    audio = np.clip(
+        audio,
+        -1.0,
+        1.0
+    )
+
+    return (
+        audio * 32767
+    ).astype(np.int16)
+
+
+def create_temporary_wav(
+    audio: np.ndarray
+) -> Path:
+    """创建供faster-whisper读取的临时WAV文件。"""
+    temporary_file = tempfile.NamedTemporaryFile(
+        suffix=".wav",
+        delete=False
+    )
+    temporary_file.close()
+
+    wav_path = Path(
+        temporary_file.name
+    )
+
+    with wave.open(
+        str(wav_path),
+        "wb"
+    ) as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(
+            SAMPLE_RATE
+        )
+
+        wav_file.writeframes(
+            float_to_pcm16(
+                audio
+            ).tobytes()
+        )
+
+    return wav_path
+
+
+def normalize_word(word: str) -> str:
+    """
+    标准化单词，用于比较连续两轮识别结果。
+
+    忽略大小写和标点，但不会修改最终显示的原始文字。
+    """
+    normalized = re.sub(
+        r"[^a-z0-9']",
+        "",
+        word.lower()
+    )
+
+    # 如果token本身只有标点，保留原始内容用于比较。
+    return normalized or word.strip()
+
+
+def find_common_prefix_length(
+    previous_words: list[WordToken],
+    current_words: list[WordToken]
+) -> int:
+    """
+    寻找连续两轮识别结果共同的最长前缀。
+
+    只有两轮都一致的单词才会被确认。
+    这就是LocalAgreement-2的核心。
+    """
+    maximum_length = min(
+        len(previous_words),
+        len(current_words)
+    )
+
+    common_length = 0
+
+    for index in range(maximum_length):
+        previous = normalize_word(
+            previous_words[index].text
+        )
+
+        current = normalize_word(
+            current_words[index].text
+        )
+
+        if previous != current:
+            break
+
+        common_length += 1
+
+    return common_length
+
+
+def join_words(
+    words: list[WordToken]
+) -> str:
+    """
+    将Whisper词级token重新组合成可读文本。
+
+    删除句号、逗号等标点前不必要的空格。
+    """
+    text = " ".join(
+        word.text.strip()
+        for word in words
+        if word.text.strip()
+    )
+
+    text = re.sub(
+        r"\s+([,.!?;:%])",
+        r"\1",
+        text
+    )
+
+    text = re.sub(
+        r"([\(\[\{])\s+",
+        r"\1",
+        text
+    )
+
+    return " ".join(
+        text.split()
+    )
 
 
 def format_time(seconds: float) -> str:
-    """将秒数转换为 00:00:00 格式。"""
-    seconds = max(0, int(seconds))
+    """把秒数转换成00:00:00格式。"""
+    seconds = max(
+        0,
+        int(seconds)
+    )
 
     hours = seconds // 3600
-    minutes = (seconds % 3600) // 60
+    minutes = (
+        seconds % 3600
+    ) // 60
     remaining = seconds % 60
 
     return (
@@ -122,182 +332,376 @@ def format_time(seconds: float) -> str:
     )
 
 
-def audio_callback(indata, frames, time_info, status):
-    """
-    sounddevice 麦克风回调。
-
-    回调中不能执行 Whisper 推理，否则会阻塞录音。
-    这里只把一帧 PCM 音频放进队列。
-    """
-    if status:
-        print(f"\n录音警告：{status}")
-
-    # InputStream 使用int16，因此可以直接转换为PCM字节。
-    frame_bytes = indata[:, 0].tobytes()
-    audio_queue.put(frame_bytes)
-
-
-def create_temporary_wav(
-    audio_bytes: bytes
-) -> Path:
-    """将一条PCM语音暂存为Whisper可读取的WAV文件。"""
-    temporary_file = tempfile.NamedTemporaryFile(
-        suffix=".wav",
-        delete=False
-    )
-    temporary_file.close()
-
-    wav_path = Path(temporary_file.name)
-
-    with wave.open(str(wav_path), "wb") as wav_file:
-        wav_file.setnchannels(1)
-        wav_file.setsampwidth(2)
-        wav_file.setframerate(SAMPLE_RATE)
-        wav_file.writeframes(audio_bytes)
-
-    return wav_path
-
-
-def transcribe_utterance(
+def transcribe_buffer(
     model: WhisperModel,
-    audio_bytes: bytes
-) -> str:
+    audio: np.ndarray
+) -> list[WordToken]:
     """
-    识别一条已经结束的语句。
+    识别当前尚未确认的音频缓冲区。
 
-    使用 beam_size=1 降低延迟。
-    由于 WebRTC VAD 已经完成语音切分，此处不再开启Whisper VAD。
+    必须开启word_timestamps，因为确认文字后需要知道
+    应该从音频缓冲区删除到哪个位置。
     """
     wav_path = create_temporary_wav(
-        audio_bytes
+        audio
     )
 
     try:
         segments, _ = model.transcribe(
             str(wav_path),
             language="en",
+
+            # 实时识别优先低延迟。
             beam_size=1,
             best_of=1,
+
+            word_timestamps=True,
+
+            # 连续讲话时不能等待VAD分句。
             vad_filter=False,
+
             condition_on_previous_text=False,
             temperature=0,
-            without_timestamps=True,
-            initial_prompt=(
-                "This is an English university lecture about "
-                "electronic engineering, mathematics, physics, "
-                "programming, circuits, signals, systems, "
-                "robotics and artificial intelligence."
+
+            initial_prompt=COURSE_PROMPT
+        )
+
+        words: list[WordToken] = []
+
+        # faster-whisper的segments是生成器，
+        # 真正推理会在这里迭代时发生。
+        for segment in segments:
+            if segment.words is None:
+                continue
+
+            for word in segment.words:
+                text = word.word.strip()
+
+                if not text:
+                    continue
+
+                words.append(
+                    WordToken(
+                        text=text,
+                        start=float(word.start),
+                        end=float(word.end)
+                    )
+                )
+
+        return words
+
+    finally:
+        wav_path.unlink(
+            missing_ok=True
+        )
+
+
+def write_confirmed_text(
+    transcript_path: Path,
+    words: list[WordToken],
+    buffer_start_time: float
+):
+    """
+    将新确认的文字向下输出，并写入字幕文件。
+
+    每次只输出这次新确认的部分，不重复输出历史文字。
+    """
+    if not words:
+        return
+
+    text = join_words(words)
+
+    if not text:
+        return
+
+    absolute_start = (
+        buffer_start_time +
+        words[0].start
+    )
+
+    absolute_end = (
+        buffer_start_time +
+        words[-1].end
+    )
+
+    timestamp = (
+        f"[{format_time(absolute_start)}"
+        f"–{format_time(absolute_end)}]"
+    )
+
+    line = f"{timestamp} {text}"
+
+    print(
+        line,
+        flush=True
+    )
+
+    with transcript_path.open(
+        "a",
+        encoding="utf-8"
+    ) as transcript_file:
+        transcript_file.write(
+            line + "\n\n"
+        )
+
+
+def shift_word_timestamps(
+    words: list[WordToken],
+    removed_seconds: float
+) -> list[WordToken]:
+    """
+    音频缓冲区前端被删除后，相应调整未确认单词时间戳。
+
+    这些时间戳主要用于维持流式状态；
+    下一轮Whisper仍会从新缓冲区重新识别。
+    """
+    shifted = []
+
+    for word in words:
+        shifted.append(
+            WordToken(
+                text=word.text,
+                start=max(
+                    0.0,
+                    word.start -
+                    removed_seconds
+                ),
+                end=max(
+                    0.0,
+                    word.end -
+                    removed_seconds
+                )
             )
         )
 
-        text = " ".join(
-            segment.text.strip()
-            for segment in segments
-            if segment.text.strip()
-        )
-
-        # 合并多余空格，但不修改模型识别出的单词。
-        return " ".join(text.split())
-
-    finally:
-        wav_path.unlink(missing_ok=True)
+    return shifted
 
 
-def transcription_worker(
+def recognition_worker(
     model: WhisperModel,
+    streaming_buffer: StreamingAudioBuffer,
     transcript_path: Path
 ):
     """
-    后台识别线程。
+    后台流式识别线程。
 
-    主线程持续录音并检测停顿；这个线程逐条处理完整语句。
-    因此Whisper推理不会阻止麦克风继续录音。
+    连续两轮识别相同的前缀会立即确认。
+    麦克风录音由主线程负责，因此推理不会中断录音。
     """
-    while True:
-        task = transcription_queue.get()
+    previous_words: list[
+        WordToken
+    ] = []
 
-        # None是结束信号：所有已提交语句处理完成后退出。
-        if task is None:
-            transcription_queue.task_done()
-            break
+    # 记录上一次处理到的绝对音频末尾，
+    # 避免没有新声音时重复识别相同缓冲区。
+    last_processed_audio_end = 0.0
 
-        inference_started = time.monotonic()
+    while not stop_event.is_set():
+        audio, buffer_start_time = (
+            streaming_buffer.snapshot()
+        )
+
+        buffer_duration = (
+            len(audio) /
+            SAMPLE_RATE
+        )
+
+        absolute_audio_end = (
+            buffer_start_time +
+            buffer_duration
+        )
+
+        new_audio_duration = (
+            absolute_audio_end -
+            last_processed_audio_end
+        )
+
+        if (
+            buffer_duration <
+            MINIMUM_BUFFER_SECONDS
+            or new_audio_duration <
+            UPDATE_INTERVAL_SECONDS
+        ):
+            stop_event.wait(0.05)
+            continue
+
+        inference_started = (
+            time.monotonic()
+        )
 
         try:
-            text = transcribe_utterance(
-                model,
-                task.audio_bytes
-            )
-
-            inference_time = (
-                time.monotonic() -
-                inference_started
-            )
-
-            if text:
-                timestamp = (
-                    f"[{format_time(task.start_time)}"
-                    f"–{format_time(task.end_time)}]"
+            current_words = (
+                transcribe_buffer(
+                    model,
+                    audio
                 )
-
-                line = f"{timestamp} {text}"
-
-                # 每条字幕固定向下输出，不再覆盖上一行。
-                print(line, flush=True)
-
-                with transcript_path.open(
-                    "a",
-                    encoding="utf-8"
-                ) as transcript_file:
-                    transcript_file.write(
-                        line + "\n\n"
-                    )
-
-                # 显示推理耗时，方便判断能否达到3秒目标。
-                print(
-                    f"    识别耗时：{inference_time:.2f}s",
-                    flush=True
-                )
+            )
 
         except Exception as error:
             print(
-                f"识别失败：{error}",
+                f"\n识别错误：{error}",
                 flush=True
             )
 
-        finally:
-            transcription_queue.task_done()
+            stop_event.wait(0.5)
+            continue
 
+        inference_time = (
+            time.monotonic() -
+            inference_started
+        )
 
-def submit_utterance(
-    utterance_frames: list[bytes],
-    speech_frame_count: int,
-    start_time: float,
-    end_time: float
-):
-    """
-    将已结束的语句提交给后台识别线程。
+        last_processed_audio_end = (
+            absolute_audio_end
+        )
 
-    太短的声音不会提交，避免键盘声、咳嗽或碰撞声触发字幕。
-    """
-    if speech_frame_count < MIN_SPEECH_FRAMES:
-        return
+        common_length = (
+            find_common_prefix_length(
+                previous_words,
+                current_words
+            )
+        )
 
-    task = TranscriptionTask(
-        audio_bytes=b"".join(
-            utterance_frames
-        ),
-        start_time=start_time,
-        end_time=end_time
+        if common_length > 0:
+            confirmed_words = (
+                current_words[
+                    :common_length
+                ]
+            )
+
+            write_confirmed_text(
+                transcript_path,
+                confirmed_words,
+                buffer_start_time
+            )
+
+            trim_end = (
+                confirmed_words[-1].end
+            )
+
+            streaming_buffer.trim(
+                trim_end
+            )
+
+            # 保留本轮尚未确认的后缀，
+            # 下一轮将与新的识别结果继续比较。
+            previous_words = (
+                shift_word_timestamps(
+                    current_words[
+                        common_length:
+                    ],
+                    trim_end
+                )
+            )
+
+        else:
+            previous_words = (
+                current_words
+            )
+
+        # 如果模型速度跟不上，输出提示方便后续调参。
+        if (
+            inference_time >
+            UPDATE_INTERVAL_SECONDS * 2
+        ):
+            print(
+                f"[性能提示] 单次识别耗时 "
+                f"{inference_time:.2f}s",
+                flush=True
+            )
+
+        # 长时间无法形成共同前缀时启用保护机制。
+        audio, buffer_start_time = (
+            streaming_buffer.snapshot()
+        )
+
+        buffer_duration = (
+            len(audio) /
+            SAMPLE_RATE
+        )
+
+        if (
+            buffer_duration >
+            MAXIMUM_BUFFER_SECONDS
+            and previous_words
+        ):
+            safe_cutoff = (
+                buffer_duration -
+                FORCED_KEEP_SECONDS
+            )
+
+            forced_words = [
+                word
+                for word in previous_words
+                if word.end <= safe_cutoff
+            ]
+
+            if forced_words:
+                write_confirmed_text(
+                    transcript_path,
+                    forced_words,
+                    buffer_start_time
+                )
+
+                trim_end = (
+                    forced_words[-1].end
+                )
+
+                streaming_buffer.trim(
+                    trim_end
+                )
+
+                previous_words = [
+                    WordToken(
+                        text=word.text,
+                        start=max(
+                            0,
+                            word.start -
+                            trim_end
+                        ),
+                        end=max(
+                            0,
+                            word.end -
+                            trim_end
+                        )
+                    )
+                    for word in previous_words
+                    if word.end > trim_end
+                ]
+
+    # 停止录音后，对剩余音频做最后一次识别。
+    audio, buffer_start_time = (
+        streaming_buffer.snapshot()
     )
 
-    transcription_queue.put(task)
+    if (
+        len(audio) / SAMPLE_RATE >= 0.3
+    ):
+        try:
+            final_words = transcribe_buffer(
+                model,
+                audio
+            )
+
+            write_confirmed_text(
+                transcript_path,
+                final_words,
+                buffer_start_time
+            )
+
+        except Exception as error:
+            print(
+                f"\n最后一段识别失败：{error}",
+                flush=True
+            )
 
 
 def main():
-    """启动一句一条的实时课堂字幕。"""
-    print("HearReview v0.3.1")
-    print(f"正在加载 {MODEL_NAME} 模型……")
+    """启动HearReview流式字幕。"""
+    print("HearReview v0.4")
+    print(
+        f"正在加载 {MODEL_NAME}……"
+    )
 
     model = WhisperModel(
         MODEL_NAME,
@@ -312,14 +716,24 @@ def main():
         f"{COMPUTE_TYPE}"
     )
 
-    transcript_folder = Path("transcripts")
-    recording_folder = Path("recordings")
+    transcript_folder = Path(
+        "transcripts"
+    )
+    recording_folder = Path(
+        "recordings"
+    )
 
-    transcript_folder.mkdir(exist_ok=True)
-    recording_folder.mkdir(exist_ok=True)
+    transcript_folder.mkdir(
+        exist_ok=True
+    )
+    recording_folder.mkdir(
+        exist_ok=True
+    )
 
-    session_name = datetime.now().strftime(
-        "%Y%m%d-%H%M%S"
+    session_name = (
+        datetime.now().strftime(
+            "%Y%m%d-%H%M%S"
+        )
     )
 
     transcript_path = (
@@ -341,186 +755,85 @@ def main():
         str(recording_path),
         "wb"
     )
-    recording_file.setnchannels(1)
+
+    recording_file.setnchannels(
+        CHANNELS
+    )
     recording_file.setsampwidth(2)
-    recording_file.setframerate(SAMPLE_RATE)
-
-    # aggressiveness范围为0至3：
-    # 0最宽松，3最严格。课堂环境先使用2。
-    vad = webrtcvad.Vad(2)
-
-    pre_roll: deque[bytes] = deque(
-        maxlen=PRE_ROLL_FRAMES
+    recording_file.setframerate(
+        SAMPLE_RATE
     )
 
-    utterance_frames: list[bytes] = []
-
-    speech_active = False
-    speech_frame_count = 0
-    silence_frame_count = 0
-
-    total_frames = 0
-    utterance_start_time = 0.0
+    streaming_buffer = (
+        StreamingAudioBuffer()
+    )
 
     worker = threading.Thread(
-        target=transcription_worker,
-        args=(model, transcript_path),
+        target=recognition_worker,
+        args=(
+            model,
+            streaming_buffer,
+            transcript_path
+        ),
         daemon=False
     )
+
     worker.start()
 
-    print("\n开始录音")
-    print("检测到约0.7秒停顿后输出完整句子")
+    print("\n开始流式字幕")
+    print(
+        "连续两轮确认的文字会向下输出"
+    )
     print("按 Ctrl+C 停止\n")
 
     try:
         with sd.InputStream(
             samplerate=SAMPLE_RATE,
-            channels=1,
-            dtype="int16",
-
-            # 30毫秒一帧，满足WebRTC VAD要求。
-            blocksize=FRAME_SAMPLES,
-
+            channels=CHANNELS,
+            dtype="float32",
+            blocksize=(
+                CALLBACK_BLOCK_SAMPLES
+            ),
             callback=audio_callback
         ):
             while True:
-                frame_bytes = audio_queue.get()
+                audio_block = (
+                    audio_queue.get()
+                )
 
+                # 完整录音始终保存。
                 recording_file.writeframes(
-                    frame_bytes
+                    float_to_pcm16(
+                        audio_block
+                    ).tobytes()
                 )
 
-                total_frames += 1
-                current_time = (
-                    total_frames *
-                    FRAME_DURATION_MS /
-                    1000
+                # 将音频提供给流式识别器。
+                streaming_buffer.append(
+                    audio_block
                 )
-
-                try:
-                    is_speech = vad.is_speech(
-                        frame_bytes,
-                        SAMPLE_RATE
-                    )
-                except Exception as error:
-                    print(
-                        f"\nVAD错误：{error}"
-                    )
-                    continue
-
-                if not speech_active:
-                    # 未讲话时持续保留最近0.3秒，避免丢失句首。
-                    pre_roll.append(
-                        frame_bytes
-                    )
-
-                    if is_speech:
-                        speech_active = True
-
-                        utterance_frames = list(
-                            pre_roll
-                        )
-
-                        utterance_start_time = max(
-                            0,
-                            current_time -
-                            len(utterance_frames) *
-                            FRAME_DURATION_MS /
-                            1000
-                        )
-
-                        speech_frame_count = 1
-                        silence_frame_count = 0
-
-                    continue
-
-                # 已处于讲话状态，所有帧都加入当前语句。
-                utterance_frames.append(
-                    frame_bytes
-                )
-
-                if is_speech:
-                    speech_frame_count += 1
-                    silence_frame_count = 0
-                else:
-                    silence_frame_count += 1
-
-                reached_silence = (
-                    silence_frame_count >=
-                    SILENCE_FRAMES_TO_FINISH
-                )
-
-                reached_maximum_length = (
-                    len(utterance_frames) >=
-                    MAX_UTTERANCE_FRAMES
-                )
-
-                if (
-                    reached_silence or
-                    reached_maximum_length
-                ):
-                    # end_time去除用于确认结束的尾部静音。
-                    if reached_silence:
-                        end_time = max(
-                            utterance_start_time,
-                            current_time -
-                            SILENCE_TO_FINISH_SECONDS
-                        )
-                    else:
-                        end_time = current_time
-
-                    submit_utterance(
-                        utterance_frames,
-                        speech_frame_count,
-                        utterance_start_time,
-                        end_time
-                    )
-
-                    # 将最后几帧留作下一句话的句首预录音。
-                    pre_roll.clear()
-
-                    for frame in utterance_frames[
-                        -PRE_ROLL_FRAMES:
-                    ]:
-                        pre_roll.append(frame)
-
-                    utterance_frames = []
-                    speech_active = False
-                    speech_frame_count = 0
-                    silence_frame_count = 0
 
     except KeyboardInterrupt:
-        print("\n正在结束录音……")
-
-        # 如果用户在老师讲话期间停止程序，
-        # 仍然提交尚未处理的最后一句。
-        if speech_active and utterance_frames:
-            current_time = (
-                total_frames *
-                FRAME_DURATION_MS /
-                1000
-            )
-
-            submit_utterance(
-                utterance_frames,
-                speech_frame_count,
-                utterance_start_time,
-                current_time
-            )
+        print(
+            "\n正在处理最后一段……"
+        )
 
     finally:
         recording_file.close()
+        stop_event.set()
 
-        # None必须排在所有已提交语句之后。
-        transcription_queue.put(None)
-
-        print("等待剩余字幕处理完成……")
+        # 等待最后一段完成。
         worker.join()
 
         print("\nHearReview 已停止")
-        print("字幕：", transcript_path.resolve())
-        print("录音：", recording_path.resolve())
+        print(
+            "字幕：",
+            transcript_path.resolve()
+        )
+        print(
+            "录音：",
+            recording_path.resolve()
+        )
 
 
 if __name__ == "__main__":
