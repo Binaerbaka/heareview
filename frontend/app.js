@@ -703,7 +703,7 @@ async function stopSession() {
 */
 function downloadJsonSession() {
     const session = {
-        version: "HearReview v0.5",
+        version: "HearReview v0.5.2",
         created_at: new Date().toISOString(),
         events: rawEvents
     };
@@ -757,7 +757,7 @@ function downloadMarkdownTranscript() {
         `# ${courseName}`,
         "",
         `- Created: ${createdAt}`,
-        `- Application: HearReview v0.5.1`,
+        `- Application: HearReview v0.5.2`,
         `- Confirmed segments: ${latestConfirmedLines.length}`,
         "",
         "## Lecture Transcript",
