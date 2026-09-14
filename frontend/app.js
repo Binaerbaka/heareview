@@ -353,6 +353,21 @@ async function startMicrophone() {
         }
 
         const input = event.inputBuffer.getChannelData(0);
+        const rms = Math.sqrt(
+            input.reduce(
+                (sum, sample) => sum + sample * sample,
+                0
+            ) / input.length
+        );
+
+        if (Date.now() - (window.lastAudioDebugTime ?? 0) > 1000) {
+            window.lastAudioDebugTime = Date.now();
+
+            console.log({
+                inputSampleRate: audioContext.sampleRate,
+                microphoneRMS: rms
+            });
+        }
 
         const downsampled = downsampleAudio(
             input,
