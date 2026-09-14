@@ -11,6 +11,18 @@
 - GPU（CUDA）加速支持
 - 实时字幕界面（GUI）
 
+## [0.5.2] - 2026-09-14
+
+### 新增
+- 课程名称输入框（默认 `Untitled Lecture`）
+- 下载拆分为两个按钮：**下载字幕**（Markdown）与 **下载JSON**
+- Markdown 导出：只包含已确认的 `lines`，含标题、创建时间、段落数、时间戳与 Speaker
+
+### 变更
+- 下载逻辑拆分为 `downloadMarkdownTranscript` 与 `downloadJsonSession`
+- 新增 `latestConfirmedLines` 快照（复制服务器返回的确认字幕，避免被后续消息修改）
+- 移除废弃的 `#download-button` 样式
+
 ## [0.5.1] - 2026-09-14
 
 ### 新增

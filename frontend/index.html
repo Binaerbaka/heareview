@@ -27,6 +27,12 @@
             <div class="panel-header">
                 <div>
                     <h2>课堂字幕</h2>
+                    <input
+                        id="course-name"
+                        type="text"
+                        placeholder="课程名称，例如 EE Lecture"
+                        value="Untitled Lecture"
+                    >
                     <p id="session-time">00:00:00</p>
                 </div>
 
@@ -63,8 +69,12 @@
                         结束课堂
                     </button>
 
-                    <button id="download-button" disabled>
-                        下载记录
+                    <button id="download-markdown-button" disabled>
+                        下载字幕
+                    </button>
+
+                    <button id="download-json-button" disabled>
+                        下载JSON
                     </button>
                 </div>
             </div>

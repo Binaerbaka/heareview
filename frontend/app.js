@@ -15,7 +15,23 @@ const TARGET_SAMPLE_RATE = 16000;
 
 const startButton = document.querySelector("#start-button");
 const stopButton = document.querySelector("#stop-button");
-const downloadButton = document.querySelector("#download-button");
+const downloadMarkdownButton = document.querySelector(
+    "#download-markdown-button"
+);
+
+const downloadJsonButton = document.querySelector(
+    "#download-json-button"
+);
+
+const courseNameInput = document.querySelector(
+    "#course-name"
+);
+
+/*
+保存服务器最近一次返回的确认字幕。
+导出Markdown时只使用确认字幕，不使用临时字幕。
+*/
+let latestConfirmedLines = [];
 
 const serverStatus = document.querySelector("#server-status");
 const confirmedContainer = document.querySelector("#confirmed-captions");
@@ -130,6 +146,17 @@ function renderConfirmedLines(lines) {
         return typeof line.text === "string" && line.text.trim() !== "";
     });
 
+    /*
+    复制一份确认字幕，避免后续服务器消息修改原对象。
+    */
+    latestConfirmedLines = validLines.map((line) => ({
+        speaker: line.speaker,
+        start: line.start,
+        end: line.end,
+        text: line.text.trim(),
+        detected_language: line.detected_language ?? null
+    }));
+
     confirmedContainer.replaceChildren();
 
     if (validLines.length === 0) {
@@ -199,7 +226,11 @@ function handleServerMessage(data) {
         data.remaining_time_transcription_processing
     );
 
-    downloadButton.disabled = rawEvents.length === 0;
+    downloadJsonButton.disabled =
+        rawEvents.length === 0;
+
+    downloadMarkdownButton.disabled =
+        latestConfirmedLines.length === 0;
 }
 
 
@@ -573,7 +604,12 @@ async function startSession() {
         startButton.disabled = true;
 
         rawEvents = [];
+        latestConfirmedLines = [];
+
         confirmedContainer.replaceChildren();
+
+        downloadMarkdownButton.disabled = true;
+        downloadJsonButton.disabled = true;
 
         await connectWebSocket();
         await startMicrophone();
@@ -583,7 +619,6 @@ async function startSession() {
         startTimer();
 
         stopButton.disabled = false;
-        downloadButton.disabled = true;
 
         partialCaption.textContent = "正在监听课堂语音……";
     } catch (error) {
@@ -650,7 +685,12 @@ async function stopSession() {
     }
 
     startButton.disabled = false;
-    downloadButton.disabled = rawEvents.length === 0;
+
+    downloadJsonButton.disabled =
+        rawEvents.length === 0;
+
+    downloadMarkdownButton.disabled =
+        latestConfirmedLines.length === 0;
 
     partialCaption.textContent = "课堂已经结束";
 }
@@ -661,7 +701,7 @@ async function stopSession() {
 
 后续可利用这些数据分析字幕稳定过程、置信度和纠错权重。
 */
-function downloadSession() {
+function downloadJsonSession() {
     const session = {
         version: "HearReview v0.5",
         created_at: new Date().toISOString(),
@@ -694,9 +734,95 @@ function downloadSession() {
 }
 
 
+/*
+将已确认字幕导出为可读Markdown。
+
+Markdown只包含最终确认的lines，
+不会包含尚未稳定的buffer_transcription。
+*/
+function downloadMarkdownTranscript() {
+    if (latestConfirmedLines.length === 0) {
+        alert("当前没有可以导出的确认字幕。");
+        return;
+    }
+
+    const courseName =
+        courseNameInput.value.trim() ||
+        "Untitled Lecture";
+
+    const createdAt =
+        new Date().toLocaleString();
+
+    const markdownLines = [
+        `# ${courseName}`,
+        "",
+        `- Created: ${createdAt}`,
+        `- Application: HearReview v0.5.1`,
+        `- Confirmed segments: ${latestConfirmedLines.length}`,
+        "",
+        "## Lecture Transcript",
+        ""
+    ];
+
+    for (const line of latestConfirmedLines) {
+        const speaker =
+            Number(line.speaker) > 0
+                ? `Speaker ${line.speaker}`
+                : "Speaker";
+
+        markdownLines.push(
+            `### ${line.start ?? "--:--"}–${line.end ?? "--:--"} · ${speaker}`
+        );
+
+        markdownLines.push("");
+        markdownLines.push(line.text);
+        markdownLines.push("");
+    }
+
+    const markdown = markdownLines.join("\n");
+
+    const blob = new Blob(
+        [markdown],
+        {
+            type: "text/markdown;charset=utf-8"
+        }
+    );
+
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+
+    const safeCourseName = courseName
+        .replace(/[<>:"/\\|?*]+/g, "-")
+        .replace(/\s+/g, "-");
+
+    const date = new Date()
+        .toISOString()
+        .slice(0, 10);
+
+    link.href = url;
+    link.download =
+        `${safeCourseName}-${date}.md`;
+
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+
+    URL.revokeObjectURL(url);
+}
+
+
 startButton.addEventListener("click", startSession);
 stopButton.addEventListener("click", stopSession);
-downloadButton.addEventListener("click", downloadSession);
+
+downloadMarkdownButton.addEventListener(
+    "click",
+    downloadMarkdownTranscript
+);
+
+downloadJsonButton.addEventListener(
+    "click",
+    downloadJsonSession
+);
 
 refreshDevicesButton.addEventListener(
     "click",

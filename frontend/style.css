@@ -144,12 +144,6 @@ button:disabled {
     color: white;
 }
 
-#download-button {
-    background: var(--panel-light);
-    color: var(--text);
-    border: 1px solid var(--border);
-}
-
 .confirmed-captions {
     flex: 1;
     min-height: 0;
@@ -334,4 +328,26 @@ button:disabled {
 
 #volume-status.active {
     color: var(--success);
+}
+
+#course-name {
+    width: min(320px, 70vw);
+    margin-top: 8px;
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    outline: none;
+    background: var(--panel-light);
+    color: var(--text);
+}
+
+#course-name:focus {
+    border-color: var(--accent);
+}
+
+#download-markdown-button,
+#download-json-button {
+    background: var(--panel-light);
+    color: var(--text);
+    border: 1px solid var(--border);
 }
