@@ -330,6 +330,14 @@ button:disabled {
     color: var(--success);
 }
 
+#volume-status.low {
+    color: #ffd166;
+}
+
+#volume-status.error {
+    color: var(--danger);
+}
+
 #course-name {
     width: min(320px, 70vw);
     margin-top: 8px;
