@@ -30,6 +30,30 @@
                     <p id="session-time">00:00:00</p>
                 </div>
 
+                <div class="audio-controls">
+                    <label for="microphone-select">输入设备</label>
+
+                    <div class="device-row">
+                        <select id="microphone-select">
+                            <option value="">系统默认麦克风</option>
+                        </select>
+
+                        <button id="refresh-devices-button" type="button">
+                            刷新
+                        </button>
+                    </div>
+
+                    <div class="volume-row">
+                        <span>音量</span>
+
+                        <div class="volume-track">
+                            <div id="volume-level" class="volume-level"></div>
+                        </div>
+
+                        <span id="volume-status">未检测</span>
+                    </div>
+                </div>
+
                 <div class="controls">
                     <button id="start-button">
                         开始课堂

@@ -262,3 +262,76 @@ button:disabled {
         flex-wrap: wrap;
     }
 }
+
+.audio-controls {
+    min-width: 280px;
+}
+
+.audio-controls label {
+    display: block;
+    margin-bottom: 6px;
+    color: var(--muted);
+    font-size: 12px;
+}
+
+.device-row {
+    display: flex;
+    gap: 8px;
+}
+
+#microphone-select {
+    flex: 1;
+    min-width: 0;
+    padding: 9px 10px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    outline: none;
+    background: var(--panel-light);
+    color: var(--text);
+}
+
+#refresh-devices-button {
+    padding: 8px 11px;
+    background: var(--panel-light);
+    color: var(--text);
+    border: 1px solid var(--border);
+}
+
+.volume-row {
+    margin-top: 9px;
+    display: grid;
+    grid-template-columns: auto 1fr auto;
+    align-items: center;
+    gap: 9px;
+    color: var(--muted);
+    font-size: 12px;
+}
+
+.volume-track {
+    height: 7px;
+    overflow: hidden;
+    border-radius: 999px;
+    background: #080d18;
+}
+
+.volume-level {
+    width: 0%;
+    height: 100%;
+    border-radius: inherit;
+    background: var(--success);
+    transition:
+        width 80ms linear,
+        background-color 150ms ease;
+}
+
+.volume-level.warning {
+    background: #ffd166;
+}
+
+#volume-status.silent {
+    color: var(--danger);
+}
+
+#volume-status.active {
+    color: var(--success);
+}

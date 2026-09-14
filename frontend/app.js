@@ -38,6 +38,24 @@ let rawEvents = [];
 let sessionStartedAt = null;
 let timerId = null;
 
+const microphoneSelect = document.querySelector(
+    "#microphone-select"
+);
+
+const refreshDevicesButton = document.querySelector(
+    "#refresh-devices-button"
+);
+
+const volumeLevel = document.querySelector(
+    "#volume-level"
+);
+
+const volumeStatus = document.querySelector(
+    "#volume-status"
+);
+
+let silenceStartedAt = null;
+
 
 /*
 更新顶部服务器状态。
@@ -309,16 +327,184 @@ function connectWebSocket() {
 
 
 /*
+读取浏览器可用的麦克风列表。
+
+浏览器通常只有在用户授予麦克风权限后，
+才会公开真实的设备名称。
+*/
+async function loadMicrophoneDevices(requestPermission = false) {
+    let temporaryStream = null;
+
+    try {
+        if (requestPermission) {
+            temporaryStream =
+                await navigator.mediaDevices.getUserMedia({
+                    audio: true
+                });
+        }
+
+        const devices =
+            await navigator.mediaDevices.enumerateDevices();
+
+        const microphones = devices.filter(
+            (device) => device.kind === "audioinput"
+        );
+
+        const previousSelection =
+            microphoneSelect.value;
+
+        microphoneSelect.replaceChildren();
+
+        const defaultOption =
+            document.createElement("option");
+
+        defaultOption.value = "";
+        defaultOption.textContent =
+            "系统默认麦克风";
+
+        microphoneSelect.appendChild(
+            defaultOption
+        );
+
+        microphones.forEach((microphone, index) => {
+            const option =
+                document.createElement("option");
+
+            option.value = microphone.deviceId;
+
+            option.textContent =
+                microphone.label ||
+                `麦克风 ${index + 1}`;
+
+            microphoneSelect.appendChild(
+                option
+            );
+        });
+
+        const previousStillExists =
+            microphones.some(
+                (microphone) =>
+                    microphone.deviceId ===
+                    previousSelection
+            );
+
+        if (previousStillExists) {
+            microphoneSelect.value =
+                previousSelection;
+        }
+
+    } catch (error) {
+        console.error(
+            "无法读取麦克风列表：",
+            error
+        );
+
+        alert(
+            "无法读取麦克风，请检查浏览器权限。"
+        );
+
+    } finally {
+        if (temporaryStream) {
+            temporaryStream
+                .getTracks()
+                .forEach((track) => track.stop());
+        }
+    }
+}
+
+
+/*
+根据RMS音量更新界面。
+
+这里使用对数刻度，因为人声振幅通常较小，
+直接使用线性百分比会让音量条几乎不动。
+*/
+function updateVolumeMeter(rms) {
+    const decibels =
+        20 * Math.log10(
+            Math.max(rms, 0.000001)
+        );
+
+    const percentage = Math.max(
+        0,
+        Math.min(
+            100,
+            ((decibels + 60) / 50) * 100
+        )
+    );
+
+    volumeLevel.style.width =
+        `${percentage}%`;
+
+    if (rms >= 0.002) {
+        silenceStartedAt = null;
+
+        volumeStatus.textContent =
+            "有声音";
+
+        volumeStatus.className =
+            "active";
+
+        volumeLevel.classList.remove(
+            "warning"
+        );
+
+        return;
+    }
+
+    if (silenceStartedAt === null) {
+        silenceStartedAt = Date.now();
+    }
+
+    const silentDuration =
+        Date.now() - silenceStartedAt;
+
+    if (silentDuration >= 3000) {
+        volumeStatus.textContent =
+            "没有声音";
+
+        volumeStatus.className =
+            "silent";
+
+        volumeLevel.classList.add(
+            "warning"
+        );
+    } else {
+        volumeStatus.textContent =
+            "音量较低";
+
+        volumeStatus.className = "";
+    }
+}
+
+
+/*
 开启浏览器麦克风，并将PCM音频持续发给服务器。
 */
 async function startMicrophone() {
-    mediaStream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-            channelCount: 1,
-            echoCancellation: true,
-            noiseSuppression: true,
-            autoGainControl: true
-        }
+    const selectedDeviceId =
+        microphoneSelect.value;
+
+    const audioConstraints =
+        selectedDeviceId
+            ? {
+                deviceId: {
+                    exact: selectedDeviceId
+                }
+            }
+            : true;
+
+    mediaStream =
+        await navigator.mediaDevices.getUserMedia({
+            audio: audioConstraints
+        });
+
+    const microphoneTrack =
+        mediaStream.getAudioTracks()[0];
+
+    console.log("当前麦克风：", {
+        label: microphoneTrack.label,
+        settings: microphoneTrack.getSettings()
     });
 
     audioContext = new AudioContext();
@@ -360,14 +546,7 @@ async function startMicrophone() {
             ) / input.length
         );
 
-        if (Date.now() - (window.lastAudioDebugTime ?? 0) > 1000) {
-            window.lastAudioDebugTime = Date.now();
-
-            console.log({
-                inputSampleRate: audioContext.sampleRate,
-                microphoneRMS: rms
-            });
-        }
+        updateVolumeMeter(rms);
 
         const downsampled = downsampleAudio(
             input,
@@ -518,3 +697,22 @@ function downloadSession() {
 startButton.addEventListener("click", startSession);
 stopButton.addEventListener("click", stopSession);
 downloadButton.addEventListener("click", downloadSession);
+
+refreshDevicesButton.addEventListener(
+    "click",
+    () => loadMicrophoneDevices(true)
+);
+
+/*
+麦克风插入或拔出时自动刷新设备列表。
+*/
+navigator.mediaDevices.addEventListener(
+    "devicechange",
+    () => loadMicrophoneDevices(false)
+);
+
+/*
+页面加载后先读取一次设备。
+如果名称为空，用户点击“刷新”并授权后就会显示。
+*/
+loadMicrophoneDevices(false);
