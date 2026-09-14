@@ -1,0 +1,12 @@
+.\.venv-stream\Scripts\whisperlivekit-server.exe `
+  --host 127.0.0.1 `
+  --port 8000 `
+  --model base `
+  --lan en `
+  --backend faster-whisper `
+  --backend-policy simulstreaming `
+  --disable-fast-encoder `
+  --pcm-input `
+  --no-vac `
+  --no-vad `
+  -l INFO

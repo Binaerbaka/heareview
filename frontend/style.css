@@ -1,0 +1,264 @@
+:root {
+    color-scheme: dark;
+    font-family:
+        Inter,
+        "Segoe UI",
+        "Microsoft YaHei",
+        sans-serif;
+
+    --background: #0b1020;
+    --panel: #121a2e;
+    --panel-light: #18233d;
+    --border: #263657;
+    --text: #eef3ff;
+    --muted: #93a4c7;
+    --accent: #6ea8fe;
+    --success: #48d597;
+    --danger: #ff6b7a;
+}
+
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+    min-height: 100vh;
+    background: var(--background);
+    color: var(--text);
+}
+
+.topbar {
+    height: 82px;
+    padding: 14px 28px;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel);
+
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+}
+
+.topbar h1 {
+    margin: 0;
+    font-size: 24px;
+}
+
+.topbar p {
+    margin: 4px 0 0;
+    color: var(--muted);
+    font-size: 13px;
+}
+
+.status {
+    padding: 8px 14px;
+    border-radius: 999px;
+    font-size: 14px;
+    font-weight: 600;
+}
+
+.status.offline {
+    color: var(--danger);
+    background: rgb(255 107 122 / 12%);
+}
+
+.status.online {
+    color: var(--success);
+    background: rgb(72 213 151 / 12%);
+}
+
+.status.connecting {
+    color: #ffd166;
+    background: rgb(255 209 102 / 12%);
+}
+
+.layout {
+    height: calc(100vh - 82px);
+    padding: 18px;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 280px;
+    gap: 18px;
+}
+
+.caption-panel,
+.info-card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+}
+
+.caption-panel {
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+.panel-header {
+    padding: 18px 20px;
+    border-bottom: 1px solid var(--border);
+
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 16px;
+}
+
+.panel-header h2 {
+    margin: 0;
+    font-size: 20px;
+}
+
+#session-time {
+    margin: 5px 0 0;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+}
+
+.controls {
+    display: flex;
+    gap: 10px;
+}
+
+button {
+    padding: 10px 15px;
+    border: 0;
+    border-radius: 9px;
+    background: var(--accent);
+    color: #071120;
+    cursor: pointer;
+    font-weight: 700;
+}
+
+button:hover:not(:disabled) {
+    filter: brightness(1.08);
+}
+
+button:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+
+#stop-button {
+    background: var(--danger);
+    color: white;
+}
+
+#download-button {
+    background: var(--panel-light);
+    color: var(--text);
+    border: 1px solid var(--border);
+}
+
+.confirmed-captions {
+    flex: 1;
+    min-height: 0;
+    padding: 20px;
+    overflow-y: auto;
+    scroll-behavior: smooth;
+}
+
+.caption-line {
+    margin-bottom: 18px;
+    padding: 14px 16px;
+    border-left: 3px solid var(--accent);
+    border-radius: 6px;
+    background: var(--panel-light);
+}
+
+.caption-meta {
+    margin-bottom: 7px;
+    color: var(--muted);
+    font-size: 12px;
+}
+
+.caption-text {
+    margin: 0;
+    line-height: 1.65;
+    font-size: 18px;
+}
+
+.empty-message {
+    margin-top: 80px;
+    color: var(--muted);
+    text-align: center;
+}
+
+.partial-container {
+    min-height: 100px;
+    padding: 15px 20px;
+    border-top: 1px solid var(--border);
+    background: #0e1629;
+}
+
+.partial-label {
+    color: var(--accent);
+    font-size: 12px;
+    font-weight: 700;
+}
+
+#partial-caption {
+    margin: 8px 0 0;
+    color: #bdc9df;
+    line-height: 1.55;
+    font-size: 17px;
+    font-style: italic;
+}
+
+.information-panel {
+    min-height: 0;
+    overflow-y: auto;
+
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+}
+
+.info-card {
+    padding: 17px;
+}
+
+.info-card h3 {
+    margin: 0 0 14px;
+    font-size: 16px;
+}
+
+.info-card p {
+    color: var(--muted);
+    line-height: 1.5;
+    font-size: 13px;
+}
+
+.metric {
+    margin-bottom: 12px;
+    display: flex;
+    justify-content: space-between;
+    gap: 10px;
+    color: var(--muted);
+    font-size: 13px;
+}
+
+.metric strong {
+    color: var(--text);
+    font-variant-numeric: tabular-nums;
+}
+
+@media (max-width: 850px) {
+    .layout {
+        height: auto;
+        grid-template-columns: 1fr;
+    }
+
+    .caption-panel {
+        min-height: 75vh;
+    }
+
+    .panel-header {
+        align-items: flex-start;
+        flex-direction: column;
+    }
+
+    .controls {
+        flex-wrap: wrap;
+    }
+}

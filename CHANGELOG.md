@@ -11,6 +11,25 @@
 - GPU（CUDA）加速支持
 - 实时字幕界面（GUI）
 
+## [0.5.0] - 2026-09-14
+
+### 新增
+- **自定义 Web 界面**：`frontend/`（`index.html`、`style.css`、`app.js`）
+- 浏览器麦克风采集，实时重采样为 16 kHz 单声道 PCM16
+- 通过 WebSocket 连接 WhisperLiveKit（`ws://127.0.0.1:8000/asr`）
+- `lines` 作为已确认字幕**全量重渲染**（不盲目追加）
+- `buffer_transcription` 作为临时字幕，仅更新底部区域
+- 自动滚动、课堂计时器、服务器连接状态
+- 显示转录 / 确认策略 / 模型处理积压时间
+- 保存全部原始 JSON，一键下载课堂记录
+- 开始 / 停止课堂按钮
+- `start_server.ps1`：一键启动 WhisperLiveKit 服务
+
+### 说明
+- 识别后端切换到 **WhisperLiveKit + SimulStreaming**（`base` 模型，faster-whisper）
+- 前端原型使用 `ScriptProcessorNode`，后续可替换为 AudioWorklet
+- 语音识别参数保持不变，本版仅新增界面
+
 ## [0.4.0] - 2026-09-14
 
 ### 新增

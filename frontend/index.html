@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta
+        name="viewport"
+        content="width=device-width, initial-scale=1.0"
+    >
+    <title>HearReview</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+    <header class="topbar">
+        <div>
+            <h1>HearReview</h1>
+            <p>Real-time Lecture Assistant</p>
+        </div>
+
+        <div id="server-status" class="status offline">
+            服务器未连接
+        </div>
+    </header>
+
+    <main class="layout">
+        <section class="caption-panel">
+            <div class="panel-header">
+                <div>
+                    <h2>课堂字幕</h2>
+                    <p id="session-time">00:00:00</p>
+                </div>
+
+                <div class="controls">
+                    <button id="start-button">
+                        开始课堂
+                    </button>
+
+                    <button id="stop-button" disabled>
+                        结束课堂
+                    </button>
+
+                    <button id="download-button" disabled>
+                        下载记录
+                    </button>
+                </div>
+            </div>
+
+            <!-- 已确认字幕会持续向下显示。 -->
+            <div id="confirmed-captions" class="confirmed-captions">
+                <div class="empty-message">
+                    点击“开始课堂”后，实时字幕将显示在这里。
+                </div>
+            </div>
+
+            <!-- 临时字幕允许随模型输出不断变化。 -->
+            <div class="partial-container">
+                <span class="partial-label">正在识别</span>
+                <p id="partial-caption">等待语音……</p>
+            </div>
+        </section>
+
+        <aside class="information-panel">
+            <section class="info-card">
+                <h3>处理状态</h3>
+
+                <div class="metric">
+                    <span>转录积压</span>
+                    <strong id="transcription-lag">0.0s</strong>
+                </div>
+
+                <div class="metric">
+                    <span>确认策略积压</span>
+                    <strong id="policy-lag">0.0s</strong>
+                </div>
+
+                <div class="metric">
+                    <span>模型处理积压</span>
+                    <strong id="processing-lag">0.0s</strong>
+                </div>
+            </section>
+
+            <section class="info-card">
+                <h3>当前版本</h3>
+                <p>HearReview v0.5</p>
+                <p>WhisperLiveKit + SimulStreaming</p>
+            </section>
+
+            <section class="info-card">
+                <h3>使用提示</h3>
+                <p>确认字幕会固定保存。</p>
+                <p>底部灰色文字属于临时字幕，可能发生修改。</p>
+            </section>
+        </aside>
+    </main>
+
+    <script src="app.js"></script>
+</body>
+</html>
