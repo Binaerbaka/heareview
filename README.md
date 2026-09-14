@@ -5,10 +5,11 @@
 ## 功能
 
 - 实时采集麦克风音频
-- 每 8 秒（带 2 秒重叠）调用 Whisper 转写一次
-- 自动去除重复句子与跨段重叠文字
-- 输出带时间戳的字幕文件（Markdown）
+- WebRTC VAD 检测讲话与停顿，按“一句一条”切分语音
+- 检测到约 0.7 秒停顿后，把完整句子交给 Whisper 识别
+- 识别结果固定向下追加，输出带时间戳的字幕（Markdown）
 - 同时保存完整课堂录音（WAV）
+- 录音与识别分线程运行，识别期间不丢失声音
 
 ## 环境要求
 
@@ -17,12 +18,16 @@
   - `numpy`
   - `sounddevice`
   - `faster-whisper`
+  - `webrtcvad`（Python 3.13 请用预编译轮子 `webrtcvad-wheels`）
 
 安装依赖：
 
 ```bash
 pip install numpy sounddevice faster-whisper
+pip install webrtcvad-wheels
 ```
+
+> 注意：直接安装 `webrtcvad` 在 Python 3.13 上会因缺少 MSVC 编译失败，使用 `webrtcvad-wheels` 即可提供同名 `webrtcvad` 模块。
 
 ## 使用方法
 
@@ -30,8 +35,8 @@ pip install numpy sounddevice faster-whisper
 python main.py
 ```
 
-- 启动后自动加载 Whisper 模型（`small.en`，CPU int8）
-- 按 `Ctrl+C` 停止
+- 启动后自动加载 Whisper 模型（`base.en`，CPU int8）
+- 按 `Ctrl+C` 停止，会先处理完剩余字幕再退出
 - 字幕输出到 `transcripts/lecture-<时间>.md`
 - 录音保存到 `recordings/lecture-<时间>.wav`
 
