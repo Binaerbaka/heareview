@@ -1,7 +1,7 @@
 "use strict";
 
 /*
- * HearReview v0.6.0
+ * HearReview v0.6.3
  *
  * 设计目标：
  * 1. 长时间课堂中不保存音频，控制内存和磁盘占用。
@@ -12,7 +12,7 @@
  * 6. 基于已确认字幕实时生成课堂要点（v0.6）。
  */
 
-const APP_VERSION = "HearReview v0.6.0";
+const APP_VERSION = "HearReview v0.6.3";
 const TARGET_SAMPLE_RATE = 16000;
 const DEBUG_EVENT_LIMIT = 100;
 const STOP_TIMEOUT_MS = 15000;
@@ -35,6 +35,21 @@ const SUMMARY_MIN_NEW_CHARACTERS = 420;
 const SUMMARY_MIN_INTERVAL_MS = 45000;
 const SUMMARY_MAX_CONTEXT_CHARACTERS = 8000;
 const SUMMARY_MAX_LIST_ITEMS = 5;
+const TRANSLATION_SETTINGS_KEY = "heareview.translation.settings.v1";
+const TRANSLATION_BATCH_SIZE = 3;
+const TRANSLATION_DEBOUNCE_MS = 1200;
+const PARTIAL_TRANSLATION_DEBOUNCE_MS = 1000;
+const PARTIAL_TRANSLATION_MAX_WAIT_MS = 3000;
+const PARTIAL_TRANSLATION_MIN_INTERVAL_MS = 1000;
+const PARTIAL_TRANSLATION_SOURCE_LIMIT = 800;
+
+/*
+ * 两次翻译请求之间的最小间隔。
+ *
+ * 未配置 LLM 或服务断开时，失败重试也会受此冷却限制，
+ * 避免每来一条字幕就失败一次。
+ */
+const TRANSLATION_MIN_INTERVAL_MS = 4000;
 
 /* -------------------------------------------------------------------------- */
 /* DOM 元素检查                                                                */
@@ -62,6 +77,7 @@ const downloadJsonButton = requireElement("download-json-button");
 const serverStatus = requireElement("server-status");
 const confirmedCaptions = requireElement("confirmed-captions");
 const partialCaption = requireElement("partial-caption");
+const partialTranslationCaption = requireElement("partial-translation-caption");
 
 const transcriptionLag = requireElement("transcription-lag");
 const policyLag = requireElement("policy-lag");
@@ -88,6 +104,12 @@ const summaryProviderNote = requireElement("summary-provider-note");
 const summaryNowButton = requireElement("summary-now-button");
 const summarySettingsButton = requireElement("summary-settings-button");
 const summaryCloseSettingsButton = requireElement("summary-close-settings");
+const appLayout = requireElement("app-layout");
+const sidebarResizer = requireElement("sidebar-resizer");
+const summaryResizer = requireElement("summary-resizer");
+const translationToggle = requireElement("translation-toggle");
+const translationDirection = requireElement("translation-direction");
+const translationState = requireElement("translation-state");
 
 /* -------------------------------------------------------------------------- */
 /* 运行状态                                                                    */
@@ -146,6 +168,22 @@ let summaryIsGenerating = false;
 let summaryLastRequestedAt = 0;
 let summarySummarizedCharacters = 0;
 let summaryCurrentReview = null;
+let translationEnabled = false;
+let translationTimer = null;
+let translationRequestInFlight = false;
+let translationEpoch = 0;
+let translationLastRequestedAt = 0;
+const translationCache = new Map();
+let partialTranslationTimer = null;
+let partialTranslationInFlight = false;
+let partialTranslationRevision = 0;
+let partialTranslationEpoch = 0;
+let partialTranslationRequestId = 0;
+let partialTranslationLastRenderedRequestId = 0;
+let partialTranslationCycleStartedAt = 0;
+let partialTranslationSourceText = "";
+let partialTranslationLastRequestedAt = 0;
+let latestPartialTranscription = "";
 
 /*
  * 已创建的字幕 DOM。
@@ -483,6 +521,20 @@ function formatCaptionTimestamp(value) {
  * 尝试读取服务器提供的稳定字幕行 ID。
  */
 function getSourceLineId(line) {
+    /*
+     * sessionData 中的字幕会被再次 normalizeLines()，
+     * 例如翻译结果回写后重新渲染。
+     *
+     * 此时服务器原始 id 字段未必还在，但 Symbol 形式的内部稳定 ID
+     * 仍存在，必须优先保留，否则翻译缓存 key 会从 source-id 变成
+     * speaker-start，造成“翻译成功却不显示”。
+     */
+    const existingInternalId = line[LINE_SOURCE_ID];
+
+    if (typeof existingInternalId === "string" && existingInternalId) {
+        return existingInternalId;
+    }
+
     const candidates = [
         line.id,
         line.line_id,
@@ -536,11 +588,29 @@ function normalizeLines(lines) {
                 return null;
             }
 
+            /*
+             * speaker 为 null / undefined / 空字符串时保持 null。
+             *
+             * 注意：Number(null) === 0。如果不先排除 null，
+             * 对已经规范化的字幕再次调用 normalizeLines 时，
+             * speaker 会从 null 变成 0，导致 DOM key 变化、
+             * 译文缓存失配（v0.6.1 会重渲染已规范化的字幕）。
+             */
+            const rawSpeaker = line.speaker;
+
+            const normalizedSpeaker =
+                rawSpeaker === null ||
+                rawSpeaker === undefined ||
+                rawSpeaker === ""
+                    ? null
+                    : (
+                        Number.isFinite(Number(rawSpeaker))
+                            ? Number(rawSpeaker)
+                            : null
+                    );
+
             const normalizedLine = {
-                speaker:
-                    Number.isFinite(Number(line.speaker))
-                        ? Number(line.speaker)
-                        : null,
+                speaker: normalizedSpeaker,
 
                 start: normalizeTimestamp(line.start),
                 end: normalizeTimestamp(line.end),
@@ -625,14 +695,19 @@ function createCaptionNode() {
     const textElement = document.createElement("div");
     textElement.className = "caption-text transcript-text";
 
+    const translationElement = document.createElement("div");
+    translationElement.className = "caption-translation";
+    translationElement.hidden = true;
+
     metadataElement.append(timeElement, speakerElement);
-    lineElement.append(metadataElement, textElement);
+    lineElement.append(metadataElement, textElement, translationElement);
 
     return {
         element: lineElement,
         timeElement,
         speakerElement,
-        textElement
+        textElement,
+        translationElement
     };
 }
 
@@ -708,7 +783,11 @@ function renderConfirmedLines(lines) {
             node.speakerElement.hidden = true;
         }
 
+        const translation = getCachedTranslation(line, key);
+        line.translation = translation || null;
         node.textElement.textContent = line.text;
+        node.translationElement.textContent = translation;
+        node.translationElement.hidden = !translationEnabled || !translation;
 
         /*
          * appendChild 对已有节点只执行移动，不会复制节点。
@@ -728,6 +807,7 @@ function renderConfirmedLines(lines) {
 
     sessionData.confirmed_lines = normalizedLines;
     updateDownloadButtons();
+    scheduleTranslations(normalizedLines);
 
     /*
      * 字幕更新后按阈值判断是否自动生成课堂要点。
@@ -746,6 +826,7 @@ function clearTranscriptDisplay() {
     confirmedCaptions.replaceChildren();
 
     partialCaption.textContent = "";
+    clearPartialTranslation();
     latestPartialText = "";
 
     sessionData.confirmed_lines = [];
@@ -1204,6 +1285,461 @@ function resetSummaryPanel() {
 }
 
 /* -------------------------------------------------------------------------- */
+/* 确认字幕翻译（v0.6.1）                                                     */
+/* -------------------------------------------------------------------------- */
+
+function setTranslationState(text) {
+    translationState.textContent = text;
+}
+
+function renderTranslationVisibility() {
+    for (const node of renderedCaptionNodes.values()) {
+        node.translationElement.hidden =
+            !translationEnabled || !node.translationElement.textContent;
+    }
+}
+
+function saveTranslationSettings() {
+    localStorage.setItem(TRANSLATION_SETTINGS_KEY, JSON.stringify({
+        enabled: translationEnabled,
+        direction: translationDirection.value
+    }));
+}
+
+function initializeTranslationSettings() {
+    try {
+        const settings = JSON.parse(
+            localStorage.getItem(TRANSLATION_SETTINGS_KEY) || "{}"
+        );
+        translationEnabled = settings.enabled === true;
+        translationDirection.value = settings.direction || "en-zh";
+    } catch (error) {
+        console.warn("读取翻译设置失败：", error);
+    }
+    translationToggle.classList.toggle("is-on", translationEnabled);
+    translationToggle.setAttribute("aria-pressed", String(translationEnabled));
+    translationToggle.title = translationEnabled ? "翻译已开启" : "翻译已关闭";
+    setTranslationState(translationEnabled ? "等待字幕" : "翻译关闭");
+}
+
+function buildTranslationPrompt(items) {
+    const toChinese = translationDirection.value === "en-zh";
+    const target = toChinese ? "Simplified Chinese" : "English";
+    return [
+        {
+            role: "system",
+            content: "Translate only the supplied confirmed lecture captions into " +
+                target + ". Preserve formulas, symbols, names and technical terms. " +
+                "Return strict JSON only: {\"translations\":[{\"index\":0,\"text\":\"...\"}]}"
+        },
+        {
+            role: "user",
+            content: JSON.stringify(items.map((item, index) => ({
+                index,
+                text: item.line.text
+            })))
+        }
+    ];
+}
+
+async function requestTranslationFromLlm(items) {
+    const provider = summaryProviderInput.value;
+    const model = summaryModelInput.value.trim();
+    const apiKey = summaryApiKeyInput.value.trim();
+    if (!model || (provider !== "ollama" && !apiKey)) {
+        throw new Error("请先在 LLM 设置中填写可用的模型和 API Key。");
+    }
+    const messages = buildTranslationPrompt(items);
+    let response;
+    if (provider === "ollama") {
+        response = await fetch("http://127.0.0.1:11434/api/chat", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ model, messages, stream: false, format: "json", options: { temperature: 0.1 } })
+        });
+        if (!response.ok) throw new Error(await response.text());
+        const data = await response.json();
+        return extractSummaryJson(data.message?.content || "").translations;
+    }
+    const endpoint = summaryEndpointInput.value.trim() ||
+        (provider === "deepseek" ? "https://api.deepseek.com/chat/completions" : "");
+    if (!endpoint) throw new Error("请填写接口地址。");
+    response = await fetch(endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+        body: JSON.stringify({ model, messages, temperature: 0.1, response_format: { type: "json_object" } })
+    });
+    if (!response.ok) throw new Error(await response.text());
+    const data = await response.json();
+    return extractSummaryJson(data.choices?.[0]?.message?.content || "").translations;
+}
+
+/**
+ * 距离下次允许发起翻译请求的剩余冷却时间。
+ */
+function getTranslationCooldownRemaining() {
+    return Math.max(
+        0,
+        TRANSLATION_MIN_INTERVAL_MS -
+        (Date.now() - translationLastRequestedAt)
+    );
+}
+
+/**
+ * 安排一次翻译请求。
+ *
+ * 等待时间为 max(防抖, 剩余冷却)：
+ * 1. 连续字幕更新只触发一次请求；
+ * 2. 失败重试也受冷却限制，不会过于频繁。
+ *
+ * 回调里读取 sessionData.confirmed_lines，
+ * 保证用的是最新的字幕快照。
+ */
+function scheduleTranslations(lines) {
+    if (!translationEnabled || translationRequestInFlight) return;
+
+    const pending = getTranslationEntries(lines)
+        .filter((item) => !getCachedTranslation(item.line, item.key));
+
+    if (pending.length === 0) return;
+
+    const wait = Math.max(
+        TRANSLATION_DEBOUNCE_MS,
+        getTranslationCooldownRemaining()
+    );
+
+    window.clearTimeout(translationTimer);
+    translationTimer = window.setTimeout(() => {
+        void flushTranslations(sessionData.confirmed_lines);
+    }, wait);
+}
+
+async function flushTranslations(lines) {
+    if (!translationEnabled || translationRequestInFlight) return;
+
+    const items = getTranslationEntries(lines)
+        .filter((item) => !getCachedTranslation(item.line, item.key))
+        .slice(0, TRANSLATION_BATCH_SIZE);
+
+    if (items.length === 0) return;
+
+    /*
+     * 与临时字幕翻译串行：
+     * 同一时刻只允许一个 LLM 请求。若临时翻译正在请求，
+     * 稍后重试，不丢失确认字幕的待翻译内容。
+     */
+    if (partialTranslationInFlight) {
+        window.clearTimeout(translationTimer);
+        translationTimer = window.setTimeout(() => {
+            void flushTranslations(sessionData.confirmed_lines);
+        }, TRANSLATION_DEBOUNCE_MS);
+        return;
+    }
+
+    const epoch = translationEpoch;
+
+    translationRequestInFlight = true;
+    translationLastRequestedAt = Date.now();
+    setTranslationState("翻译中…");
+
+    try {
+        const results = await requestTranslationFromLlm(items);
+
+        /*
+         * 方向切换或新课堂会递增 epoch。
+         * 旧请求的结果必须丢弃，不能写回当前会话。
+         */
+        if (epoch !== translationEpoch) {
+            return;
+        }
+
+        for (const result of Array.isArray(results) ? results : []) {
+            const item = items[Number(result.index)];
+
+            /*
+             * 有些模型返回 translation 而不是 text，
+             * 两种字段都接受。
+             */
+            const translatedText = result.text || result.translation;
+
+            if (
+                item &&
+                typeof translatedText === "string" &&
+                translatedText.trim()
+            ) {
+                translationCache.set(item.key, {
+                    sourceText: item.line.text,
+                    translation: translatedText.trim()
+                });
+            }
+        }
+
+        renderConfirmedLines(sessionData.confirmed_lines);
+        setTranslationState("已更新");
+    } catch (error) {
+        console.warn("字幕翻译失败：", error);
+        setTranslationState("服务未连接");
+    } finally {
+        translationRequestInFlight = false;
+
+        /*
+         * 无论成功或失败，只要翻译仍然开启，
+         * 就按冷却时间安排下一次续传，
+         * 不再依赖下一条服务器消息。
+         */
+        if (translationEnabled) {
+            scheduleTranslations(sessionData.confirmed_lines);
+        }
+    }
+}
+
+function getTranslationEntries(lines) {
+    const duplicateCounts = new Map();
+    return lines.map((line) => {
+        const baseKey = createLineKey(line);
+        const duplicateNumber = duplicateCounts.get(baseKey) || 0;
+        duplicateCounts.set(baseKey, duplicateNumber + 1);
+        return { line, key: createLineKey(line, duplicateNumber) };
+    });
+}
+
+/**
+ * 读取已确认字幕的译文缓存。
+ *
+ * 缓存必须与原文关联：同一个 line key 的 text 若仍在增长，
+ * 旧译文不能永久阻止该行后续翻译。
+ * 只有原文完全一致时才视为有效缓存。
+ */
+function getCachedTranslation(line, key) {
+    const cached = translationCache.get(key);
+
+    if (cached && cached.sourceText === line.text) {
+        return cached.translation;
+    }
+
+    return "";
+}
+
+function resetTranslations() {
+    /*
+     * 递增 epoch，让仍在进行的旧请求结果被丢弃。
+     *
+     * 这里不强制 translationRequestInFlight = false，
+     * 由旧请求的 finally 自行收尾，避免新旧请求并发。
+     */
+    translationEpoch += 1;
+    translationCache.clear();
+    window.clearTimeout(translationTimer);
+    translationLastRequestedAt = 0;
+    setTranslationState(translationEnabled ? "等待字幕" : "翻译关闭");
+}
+
+/* 临时字幕翻译：只供课堂中参考，不参与导出。 */
+function clearPartialTranslation() {
+    window.clearTimeout(partialTranslationTimer);
+
+    /*
+     * 递增独立 epoch：
+     * 方向切换、关闭翻译、新课堂、结束课堂时，
+     * 仍在飞的旧请求结果必须丢弃。
+     */
+    partialTranslationEpoch += 1;
+    partialTranslationRevision += 1;
+    partialTranslationCycleStartedAt = 0;
+    partialTranslationSourceText = "";
+    partialTranslationLastRequestedAt = 0;
+    partialTranslationCaption.textContent = "";
+    partialTranslationCaption.hidden = true;
+}
+
+function schedulePartialTranslation(text, force = false) {
+    const normalizedText = String(text || "").trim();
+
+    if (!translationEnabled || !normalizedText) {
+        clearPartialTranslation();
+        return;
+    }
+
+    if (!force && normalizedText === partialTranslationSourceText) {
+        return;
+    }
+
+    const now = Date.now();
+
+    partialTranslationSourceText = normalizedText;
+    partialTranslationRevision += 1;
+
+    if (!partialTranslationCycleStartedAt) {
+        partialTranslationCycleStartedAt = now;
+    }
+
+    /*
+     * 防抖：静止约 1 秒后翻译；
+     * 同时用 MAX_WAIT 限制持续变化时的等待，约每 3 秒至少请求一次。
+     */
+    const elapsed = now - partialTranslationCycleStartedAt;
+    const cycleWait = Math.max(0, Math.min(
+        PARTIAL_TRANSLATION_DEBOUNCE_MS,
+        PARTIAL_TRANSLATION_MAX_WAIT_MS - elapsed
+    ));
+
+    /*
+     * 临时翻译使用独立的冷却时间，
+     * 不复用确认字幕的 translationLastRequestedAt。
+     */
+    const cooldownWait = Math.max(
+        0,
+        PARTIAL_TRANSLATION_MIN_INTERVAL_MS -
+        (now - partialTranslationLastRequestedAt)
+    );
+
+    const wait = Math.max(cycleWait, cooldownWait);
+    const revision = partialTranslationRevision;
+
+    window.clearTimeout(partialTranslationTimer);
+    partialTranslationTimer = window.setTimeout(() => {
+        void flushPartialTranslation(revision, normalizedText);
+    }, wait);
+}
+
+async function flushPartialTranslation(revision, text) {
+    if (!translationEnabled || revision !== partialTranslationRevision) {
+        return;
+    }
+
+    if (partialTranslationInFlight) {
+        return;
+    }
+
+    /*
+     * 与确认字幕翻译串行：
+     * 同一时刻只允许一个 LLM 请求。若确认翻译正在请求，
+     * 稍后重试，不丢失本次待翻译内容。
+     */
+    if (translationRequestInFlight) {
+        window.clearTimeout(partialTranslationTimer);
+        partialTranslationTimer = window.setTimeout(() => {
+            void flushPartialTranslation(revision, text);
+        }, PARTIAL_TRANSLATION_DEBOUNCE_MS);
+        return;
+    }
+
+    /*
+     * 每次实际请求分配递增 requestId，
+     * 用于保证较新的结果不会被较旧的结果覆盖。
+     */
+    partialTranslationRequestId += 1;
+
+    const requestId = partialTranslationRequestId;
+    const epoch = partialTranslationEpoch;
+
+    partialTranslationInFlight = true;
+    partialTranslationLastRequestedAt = Date.now();
+
+    try {
+        const results = await requestTranslationFromLlm([{ line: { text } }]);
+
+        /*
+         * 方向切换 / 关闭翻译 / 新课堂会递增 epoch，
+         * 旧 epoch 的结果必须丢弃，避免中英方向串味。
+         */
+        if (epoch !== partialTranslationEpoch || !translationEnabled) {
+            return;
+        }
+
+        /*
+         * 临时译文是“延迟参考”，允许比当前英文稍旧。
+         *
+         * 因此这里不再因为英文后续更新（revision 变化）而丢弃结果；
+         * 只要求 requestId 比已显示的更新，避免旧结果覆盖新结果。
+         */
+        if (requestId <= partialTranslationLastRenderedRequestId) {
+            return;
+        }
+
+        const result = Array.isArray(results) ? results[0] : null;
+        const translated = result && (result.text || result.translation);
+
+        if (typeof translated === "string" && translated.trim()) {
+            partialTranslationCaption.textContent = translated.trim();
+            partialTranslationCaption.hidden = false;
+            partialTranslationLastRenderedRequestId = requestId;
+        }
+    } catch (error) {
+        console.warn("临时字幕翻译失败：", error);
+    } finally {
+        partialTranslationInFlight = false;
+
+        /*
+         * 结束当前 cycle：无论成功、失败还是被丢弃，
+         * 下一次临时字幕变化都会开启新的 3 秒 cycle。
+         */
+        partialTranslationCycleStartedAt = 0;
+
+        if (translationEnabled) {
+            /*
+             * 等待期间临时文本又变化了，按防抖重新调度。
+             */
+            if (revision !== partialTranslationRevision) {
+                schedulePartialTranslation(
+                    partialTranslationSourceText,
+                    true
+                );
+            }
+
+            /*
+             * 确认字幕若有积压，在串行约束解除后重新调度。
+             */
+            scheduleTranslations(sessionData.confirmed_lines);
+        }
+    }
+}
+
+/**
+ * 选择临时翻译的原文。
+ *
+ * 1. 优先使用非空的 buffer_transcription；
+ * 2. 课堂中 buffer_transcription 常为空、而 lines 持续增长时，
+ *    在 active_transcription 状态下回退到最后一条非空 line.text，
+ *    并且只保留末尾 PARTIAL_TRANSLATION_SOURCE_LIMIT 个字符，
+ *    避免不断增长的实时字幕让 API 输入与费用无限增大；
+ * 3. 其他情况返回空字符串。
+ */
+function getLiveTranslationSource(data) {
+    const bufferTranscription =
+        typeof data.buffer_transcription === "string"
+            ? data.buffer_transcription.trim()
+            : "";
+
+    if (bufferTranscription) {
+        return bufferTranscription;
+    }
+
+    if (
+        data.status === "active_transcription" &&
+        Array.isArray(data.lines)
+    ) {
+        for (
+            let index = data.lines.length - 1;
+            index >= 0;
+            index -= 1
+        ) {
+            const line = data.lines[index];
+
+            const text =
+                line && typeof line.text === "string"
+                    ? line.text.trim()
+                    : "";
+
+            if (text) {
+                return text.slice(-PARTIAL_TRANSLATION_SOURCE_LIMIT);
+            }
+        }
+    }
+
+    return "";
+}
+
+/* -------------------------------------------------------------------------- */
 /* WhisperLiveKit 消息处理                                                     */
 /* -------------------------------------------------------------------------- */
 
@@ -1298,18 +1834,45 @@ function handleServerData(data) {
         renderConfirmedLines(data.lines);
     }
 
-    const bufferTranscription =
-        typeof data.buffer_transcription === "string"
-            ? data.buffer_transcription.trim()
-            : "";
+    const hasPartialBuffer =
+        typeof data.buffer_transcription === "string" ||
+        typeof data.buffer_translation === "string";
 
-    const bufferTranslation =
-        typeof data.buffer_translation === "string"
-            ? data.buffer_translation.trim()
-            : "";
+    if (hasPartialBuffer) {
+        const bufferTranscription =
+            typeof data.buffer_transcription === "string"
+                ? data.buffer_transcription.trim()
+                : "";
 
-    latestPartialText = bufferTranscription || bufferTranslation;
-    partialCaption.textContent = latestPartialText;
+        const bufferTranslation =
+            typeof data.buffer_translation === "string"
+                ? data.buffer_translation.trim()
+                : "";
+
+        latestPartialText = bufferTranscription || bufferTranslation;
+        partialCaption.textContent = latestPartialText;
+    }
+
+    /*
+     * 临时翻译源：优先 buffer_transcription；
+     * 课堂中它常为空而 lines 持续增长时，回退到实时 lines 末尾文本。
+     */
+    const liveTranslationSource = getLiveTranslationSource(data);
+
+    if (liveTranslationSource) {
+        latestPartialTranscription = liveTranslationSource;
+        schedulePartialTranslation(liveTranslationSource);
+    } else if (
+        typeof data.buffer_transcription === "string" &&
+        data.buffer_transcription.trim() === ""
+    ) {
+        /*
+         * 只有服务器明确发送了空的 buffer_transcription 才清空，
+         * 单纯的状态消息不会清掉已有临时参考译文。
+         */
+        latestPartialTranscription = "";
+        schedulePartialTranslation("");
+    }
 
     /*
      * data.status 是服务器协议状态，只用于程序逻辑判断。
@@ -1802,6 +2365,7 @@ async function startSession() {
     clearTranscriptDisplay();
     resetLagDisplay();
     resetSummaryPanel();
+    resetTranslations();
 
     try {
         await connectWebSocket();
@@ -1892,6 +2456,7 @@ async function stopSession() {
 
     latestPartialText = "";
     partialCaption.textContent = "";
+    clearPartialTranslation();
 
     setServerStatus(
         flushResult === "timeout"
@@ -1945,6 +2510,9 @@ function createMarkdownTranscript() {
                 : "";
 
         lines.push(`[${timeRange}]${speaker} ${line.text}`);
+        if (line.translation) {
+            lines.push(`> ${line.translation}`);
+        }
         lines.push("");
     });
 
@@ -2032,11 +2600,15 @@ summaryNowButton.addEventListener("click", () => {
 });
 
 summarySettingsButton.addEventListener("click", () => {
-    summarySettingsForm.hidden = !summarySettingsForm.hidden;
+    const willOpen = summarySettingsForm.hidden;
+
+    summarySettingsForm.hidden = !willOpen;
+    summarySettingsButton.textContent = willOpen ? "收起" : "展开";
 });
 
 summaryCloseSettingsButton.addEventListener("click", () => {
     summarySettingsForm.hidden = true;
+    summarySettingsButton.textContent = "展开";
 });
 
 summaryProviderInput.addEventListener(
@@ -2054,6 +2626,46 @@ summarySettingsForm.addEventListener(
         await generateSummary();
     }
 );
+
+translationToggle.addEventListener("click", () => {
+    translationEnabled = !translationEnabled;
+    translationToggle.classList.toggle("is-on", translationEnabled);
+    translationToggle.setAttribute("aria-pressed", String(translationEnabled));
+    translationToggle.title = translationEnabled ? "翻译已开启" : "翻译已关闭";
+    saveTranslationSettings();
+    renderTranslationVisibility();
+    setTranslationState(translationEnabled ? "等待字幕" : "翻译关闭");
+    if (translationEnabled) {
+        scheduleTranslations(sessionData.confirmed_lines);
+        schedulePartialTranslation(latestPartialTranscription, true);
+    } else {
+        clearPartialTranslation();
+    }
+});
+
+translationDirection.addEventListener("change", () => {
+    /*
+     * 递增 epoch 并清空缓存：
+     * 正在进行的旧方向请求返回后会被丢弃，
+     * 避免把旧方向译文写回当前方向。
+     */
+    translationEpoch += 1;
+    translationCache.clear();
+
+    /*
+     * 使正在飞的临时翻译结果失效（递增 revision 并清空显示），
+     * 旧方向请求返回后绝不能写入 partial-translation-caption。
+     */
+    clearPartialTranslation();
+
+    saveTranslationSettings();
+    renderTranslationVisibility();
+
+    if (translationEnabled) {
+        scheduleTranslations(sessionData.confirmed_lines);
+        schedulePartialTranslation(latestPartialTranscription, true);
+    }
+});
 
 refreshDevicesButton.addEventListener(
     "click",
@@ -2138,6 +2750,114 @@ window.addEventListener("beforeunload", (event) => {
 /* 页面初始化                                                                  */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * 初始化可调整布局（v0.6.2）。
+ *
+ * 设置栏宽度与总结面板高度会保存到 localStorage，
+ * 刷新页面后保持；窄屏下布局改为单列，不启用拖动。
+ */
+function initializeResizableLayout() {
+    const storageKey = "heareview.layout.v0.6.2";
+
+    try {
+        const saved = JSON.parse(
+            localStorage.getItem(storageKey) || "{}"
+        );
+
+        if (Number.isFinite(saved.sidebarWidth)) {
+            appLayout.style.setProperty(
+                "--sidebar-width",
+                `${saved.sidebarWidth}px`
+            );
+        }
+
+        if (Number.isFinite(saved.summaryHeight)) {
+            appLayout.style.setProperty(
+                "--summary-height",
+                `${saved.summaryHeight}px`
+            );
+        }
+    } catch (error) {
+        console.warn("读取布局设置失败：", error);
+    }
+
+    function persist() {
+        const styles = window.getComputedStyle(appLayout);
+
+        localStorage.setItem(storageKey, JSON.stringify({
+            sidebarWidth: parseFloat(
+                styles.getPropertyValue("--sidebar-width")
+            ),
+            summaryHeight: parseFloat(
+                styles.getPropertyValue("--summary-height")
+            )
+        }));
+    }
+
+    function makeResizable(handle, axis) {
+        handle.addEventListener("pointerdown", (event) => {
+            /*
+             * 窄屏下布局改为单列，拖动把手隐藏，
+             * 这里不再响应拖动。
+             */
+            if (window.matchMedia("(max-width: 850px)").matches) {
+                return;
+            }
+
+            event.preventDefault();
+            handle.setPointerCapture(event.pointerId);
+
+            document.body.classList.add("is-resizing");
+
+            const bounds = appLayout.getBoundingClientRect();
+
+            const onMove = (moveEvent) => {
+                if (axis === "x") {
+                    const width = Math.min(
+                        520,
+                        Math.max(240, bounds.right - moveEvent.clientX)
+                    );
+
+                    appLayout.style.setProperty(
+                        "--sidebar-width",
+                        `${width}px`
+                    );
+
+                    return;
+                }
+
+                const panel = document
+                    .querySelector(".caption-panel")
+                    .getBoundingClientRect();
+
+                const height = Math.min(
+                    panel.height * 0.6,
+                    Math.max(150, panel.bottom - moveEvent.clientY)
+                );
+
+                appLayout.style.setProperty(
+                    "--summary-height",
+                    `${height}px`
+                );
+            };
+
+            const onUp = () => {
+                document.body.classList.remove("is-resizing");
+                persist();
+
+                window.removeEventListener("pointermove", onMove);
+                window.removeEventListener("pointerup", onUp);
+            };
+
+            window.addEventListener("pointermove", onMove);
+            window.addEventListener("pointerup", onUp);
+        });
+    }
+
+    makeResizable(sidebarResizer, "x");
+    makeResizable(summaryResizer, "y");
+}
+
 async function initializeApplication() {
     startButton.disabled = false;
     stopButton.disabled = true;
@@ -2147,6 +2867,8 @@ async function initializeApplication() {
     resetLagDisplay();
     updateVolumeDisplay(0);
     initializeSummaryPanel();
+    initializeResizableLayout();
+    initializeTranslationSettings();
 
     sessionTime.textContent = "00:00:00";
     setServerStatus("未连接", "idle");

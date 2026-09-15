@@ -22,7 +22,7 @@
         </div>
     </header>
 
-    <main class="layout">
+    <main id="app-layout" class="layout">
         <section class="caption-panel">
             <div class="panel-header">
                 <div>
@@ -34,30 +34,6 @@
                         value="Untitled Lecture"
                     >
                     <p id="session-time">00:00:00</p>
-                </div>
-
-                <div class="audio-controls">
-                    <label for="microphone-select">输入设备</label>
-
-                    <div class="device-row">
-                        <select id="microphone-select">
-                            <option value="">系统默认麦克风</option>
-                        </select>
-
-                        <button id="refresh-devices-button" type="button">
-                            刷新
-                        </button>
-                    </div>
-
-                    <div class="volume-row">
-                        <span>音量</span>
-
-                        <div class="volume-track">
-                            <div id="volume-level" class="volume-level"></div>
-                        </div>
-
-                        <span id="volume-status">未检测</span>
-                    </div>
                 </div>
 
                 <div class="controls">
@@ -90,17 +66,27 @@
             <div class="partial-container">
                 <span class="partial-label">正在识别</span>
                 <p id="partial-caption">等待语音……</p>
+                <p id="partial-translation-caption" class="partial-translation" hidden></p>
             </div>
-        </section>
 
-        <aside class="information-panel">
-            <section class="info-card summary-card">
+            <!-- 拖动可调整总结面板高度（v0.6.2）。 -->
+            <div
+                id="summary-resizer"
+                class="resize-handle resize-horizontal"
+                role="separator"
+                aria-label="调整总结高度"
+            ></div>
+
+            <!-- 实时课堂要点：基于已确认字幕生成。 -->
+            <section class="summary-panel" id="summary-panel">
                 <div class="summary-heading">
-                    <h3>实时课堂要点</h3>
+                    <div>
+                        <h3>实时课堂要点</h3>
+                        <p class="summary-hint">基于已确认字幕生成，不影响实时转录。</p>
+                    </div>
+
                     <span id="summary-state" class="summary-state is-idle">尚未配置</span>
                 </div>
-
-                <p class="summary-hint">基于已确认字幕生成，不影响实时转录。</p>
 
                 <div id="summary-content" class="summary-content">
                     <p class="summary-placeholder">连接 LLM 后，这里会持续显示本阶段重点。</p>
@@ -108,7 +94,73 @@
 
                 <div class="summary-actions">
                     <button id="summary-now-button" type="button">生成当前总结</button>
-                    <button id="summary-settings-button" class="subtle-button" type="button">LLM 设置</button>
+                </div>
+            </section>
+        </section>
+
+        <!-- 拖动可调整设置栏宽度（v0.6.2）。 -->
+        <div
+            id="sidebar-resizer"
+            class="resize-handle resize-vertical"
+            role="separator"
+            aria-label="调整设置栏宽度"
+        ></div>
+
+        <aside class="information-panel">
+            <section class="info-card">
+                <h3>课堂设置</h3>
+
+                <label for="microphone-select">输入设备</label>
+
+                <div class="device-row">
+                    <select id="microphone-select">
+                        <option value="">系统默认麦克风</option>
+                    </select>
+
+                    <button id="refresh-devices-button" type="button">
+                        刷新
+                    </button>
+                </div>
+
+                <div class="volume-row">
+                    <span>音量</span>
+
+                    <div class="volume-track">
+                        <div id="volume-level" class="volume-level"></div>
+                    </div>
+
+                    <span id="volume-status">未检测</span>
+                </div>
+            </section>
+
+            <section class="info-card">
+                <h3>翻译</h3>
+
+                <div class="translation-control">
+                    <button
+                        id="translation-toggle"
+                        class="translation-toggle"
+                        type="button"
+                        aria-pressed="false"
+                        title="翻译已关闭"
+                    >
+                        <span class="toggle-square" aria-hidden="true"></span>
+                        翻译
+                    </button>
+
+                    <select id="translation-direction" aria-label="翻译方向">
+                        <option value="en-zh">EN → 中</option>
+                        <option value="zh-en">中 → EN</option>
+                    </select>
+                </div>
+
+                <p id="translation-state" class="translation-state">翻译关闭</p>
+            </section>
+
+            <section class="info-card">
+                <div class="summary-heading">
+                    <h3>LLM 设置</h3>
+                    <button id="summary-settings-button" class="subtle-button" type="button">展开</button>
                 </div>
 
                 <form id="summary-settings" class="summary-settings" hidden>
@@ -162,14 +214,8 @@
 
             <section class="info-card">
                 <h3>当前版本</h3>
-                <p>HearReview v0.6</p>
+                <p>HearReview v0.6.3</p>
                 <p>WhisperLiveKit + SimulStreaming</p>
-            </section>
-
-            <section class="info-card">
-                <h3>使用提示</h3>
-                <p>确认字幕会固定保存。</p>
-                <p>底部灰色文字属于临时字幕，可能发生修改。</p>
             </section>
         </aside>
     </main>
