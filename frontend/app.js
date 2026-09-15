@@ -1,7 +1,7 @@
 "use strict";
 
 /*
- * HearReview v0.5.3
+ * HearReview v0.6.0
  *
  * 设计目标：
  * 1. 长时间课堂中不保存音频，控制内存和磁盘占用。
@@ -9,13 +9,32 @@
  * 3. 使用增量 DOM 更新，避免反复重建整页字幕。
  * 4. 停止时等待服务器刷新最后一段字幕。
  * 5. 支持 Markdown 和紧凑 JSON 导出。
+ * 6. 基于已确认字幕实时生成课堂要点（v0.6）。
  */
 
-const APP_VERSION = "HearReview v0.5.3";
+const APP_VERSION = "HearReview v0.6.0";
 const TARGET_SAMPLE_RATE = 16000;
 const DEBUG_EVENT_LIMIT = 100;
 const STOP_TIMEOUT_MS = 15000;
 const STOP_QUIET_PERIOD_MS = 800;
+
+/*
+ * v0.6 实时课堂要点参数。
+ *
+ * SUMMARY_MIN_NEW_CHARACTERS:
+ *   新增多少已确认字符后允许自动生成。
+ *
+ * SUMMARY_MIN_INTERVAL_MS:
+ *   两次自动生成之间的最小间隔。
+ *
+ * SUMMARY_MAX_CONTEXT_CHARACTERS:
+ *   每次最多发送给 LLM 的字幕字符数（只取末尾）。
+ */
+const SUMMARY_SETTINGS_KEY = "heareview.summary.settings.v1";
+const SUMMARY_MIN_NEW_CHARACTERS = 420;
+const SUMMARY_MIN_INTERVAL_MS = 45000;
+const SUMMARY_MAX_CONTEXT_CHARACTERS = 8000;
+const SUMMARY_MAX_LIST_ITEMS = 5;
 
 /* -------------------------------------------------------------------------- */
 /* DOM 元素检查                                                                */
@@ -55,6 +74,21 @@ const refreshDevicesButton = requireElement("refresh-devices-button");
 const volumeLevel = requireElement("volume-level");
 const volumeStatus = requireElement("volume-status");
 
+/* v0.6 实时课堂要点面板。 */
+const summaryState = requireElement("summary-state");
+const summaryContent = requireElement("summary-content");
+const summarySettingsForm = requireElement("summary-settings");
+const summaryProviderInput = requireElement("summary-provider");
+const summaryModelInput = requireElement("summary-model");
+const summaryEndpointInput = requireElement("summary-endpoint");
+const summaryApiKeyInput = requireElement("summary-api-key");
+const summaryEndpointRow = requireElement("summary-endpoint-row");
+const summaryKeyRow = requireElement("summary-key-row");
+const summaryProviderNote = requireElement("summary-provider-note");
+const summaryNowButton = requireElement("summary-now-button");
+const summarySettingsButton = requireElement("summary-settings-button");
+const summaryCloseSettingsButton = requireElement("summary-close-settings");
+
 /* -------------------------------------------------------------------------- */
 /* 运行状态                                                                    */
 /* -------------------------------------------------------------------------- */
@@ -92,6 +126,26 @@ let stopRequestedAt = 0;
 let lastServerMessageAt = 0;
 let latestTotalLag = 0;
 let latestPartialText = "";
+
+/*
+ * v0.6 实时课堂要点状态。
+ *
+ * summaryIsGenerating:
+ *   是否正在请求 LLM，避免并发重复请求。
+ *
+ * summaryLastRequestedAt:
+ *   最近一次发起请求的时间，用于限制自动生成频率。
+ *
+ * summarySummarizedCharacters:
+ *   上次成功总结时已确认字幕的总字符数，用于判断新增量。
+ *
+ * summaryCurrentReview:
+ *   最近一次生成的总结对象。
+ */
+let summaryIsGenerating = false;
+let summaryLastRequestedAt = 0;
+let summarySummarizedCharacters = 0;
+let summaryCurrentReview = null;
 
 /*
  * 已创建的字幕 DOM。
@@ -674,6 +728,13 @@ function renderConfirmedLines(lines) {
 
     sessionData.confirmed_lines = normalizedLines;
     updateDownloadButtons();
+
+    /*
+     * 字幕更新后按阈值判断是否自动生成课堂要点。
+     * 这里是普通函数调用，不再使用 MutationObserver，
+     * 避免额外的 DOM 观察开销。
+     */
+    maybeAutoGenerateSummary();
 }
 
 /**
@@ -689,6 +750,457 @@ function clearTranscriptDisplay() {
 
     sessionData.confirmed_lines = [];
     updateDownloadButtons();
+}
+
+/* -------------------------------------------------------------------------- */
+/* 实时课堂要点（v0.6）                                                        */
+/* -------------------------------------------------------------------------- */
+
+/*
+ * 右侧“实时课堂要点”面板基于已确认字幕调用外部 LLM。
+ *
+ * 设计原则：
+ * 1. 只读取已确认字幕，不改变原有转录流程；
+ * 2. API Key 只保留在当前页面，不写入 localStorage、导出或字幕文件；
+ * 3. 新增约 SUMMARY_MIN_NEW_CHARACTERS 个字符且距上次请求至少
+ *    SUMMARY_MIN_INTERVAL_MS，才自动生成；
+ * 4. 自动生成失败时保持安静，不打断课堂。
+ */
+
+/**
+ * 创建一个简单的 DOM 节点。
+ */
+function createSummaryElement(tagName, className, text) {
+    const node = document.createElement(tagName);
+
+    if (className) {
+        node.className = className;
+    }
+
+    if (text !== undefined) {
+        node.textContent = text;
+    }
+
+    return node;
+}
+
+function readSummarySettings() {
+    const defaults = {
+        provider: "ollama",
+        model: "qwen2.5:7b",
+        endpoint: ""
+    };
+
+    try {
+        return {
+            ...defaults,
+            ...JSON.parse(
+                localStorage.getItem(SUMMARY_SETTINGS_KEY) || "{}"
+            )
+        };
+    } catch (error) {
+        console.warn("读取总结设置失败：", error);
+        return defaults;
+    }
+}
+
+function saveSummarySettings() {
+    /*
+     * API Key 有意不保存。
+     * 刷新页面后需要重新填写，避免密钥写入本机存储。
+     */
+    localStorage.setItem(
+        SUMMARY_SETTINGS_KEY,
+        JSON.stringify({
+            provider: summaryProviderInput.value,
+            model: summaryModelInput.value.trim(),
+            endpoint: summaryEndpointInput.value.trim()
+        })
+    );
+}
+
+function setSummaryState(text, tone = "idle") {
+    summaryState.textContent = text;
+    summaryState.className = `summary-state is-${tone}`;
+}
+
+function updateSummaryProviderFields() {
+    const provider = summaryProviderInput.value;
+    const isOllama = provider === "ollama";
+
+    summaryEndpointRow.hidden = isOllama;
+    summaryKeyRow.hidden = isOllama;
+
+    if (provider === "ollama") {
+        summaryProviderNote.textContent =
+            "需在本机运行 Ollama；默认地址为 http://127.0.0.1:11434。";
+
+        if (
+            !summaryModelInput.value ||
+            summaryModelInput.value === "deepseek-chat"
+        ) {
+            summaryModelInput.value = "qwen2.5:7b";
+        }
+    } else if (provider === "deepseek") {
+        summaryProviderNote.textContent =
+            "Key 只保留在当前页面。若浏览器拦截跨域请求，需在后续版本启用本地中转服务。";
+
+        if (
+            !summaryModelInput.value ||
+            summaryModelInput.value === "qwen2.5:7b"
+        ) {
+            summaryModelInput.value = "deepseek-chat";
+        }
+    } else {
+        summaryProviderNote.textContent =
+            "填写兼容 Chat Completions 的服务地址与 Key。";
+    }
+}
+
+/**
+ * 用本机保存的设置初始化面板（不含 API Key）。
+ */
+function initializeSummaryPanel() {
+    const settings = readSummarySettings();
+
+    summaryProviderInput.value = settings.provider;
+    summaryModelInput.value = settings.model;
+    summaryEndpointInput.value = settings.endpoint;
+
+    updateSummaryProviderFields();
+}
+
+/**
+ * 已确认字幕的总字符数。
+ *
+ * 使用 sessionData 而不是 DOM，也不做 8000 字符截断，
+ * 保证长时间课堂仍能正确判断新增量。
+ */
+function getConfirmedCharacterCount() {
+    let totalCharacters = 0;
+
+    for (const line of sessionData.confirmed_lines) {
+        totalCharacters += line.text.length;
+    }
+
+    return totalCharacters;
+}
+
+/**
+ * 取最近一段已确认字幕作为 LLM 上下文。
+ *
+ * 只保留末尾 SUMMARY_MAX_CONTEXT_CHARACTERS 个字符，
+ * 避免把整场课堂都发给模型。
+ */
+function getConfirmedTranscriptText() {
+    return sessionData.confirmed_lines
+        .map((line) => line.text)
+        .filter(Boolean)
+        .join("\n")
+        .slice(-SUMMARY_MAX_CONTEXT_CHARACTERS);
+}
+
+/**
+ * 从模型输出中提取 JSON。
+ *
+ * 兼容 ```json 代码块和前后附带说明文字的情况。
+ */
+function extractSummaryJson(text) {
+    const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+    const candidate = (fenced ? fenced[1] : text).trim();
+
+    const start = candidate.indexOf("{");
+    const end = candidate.lastIndexOf("}");
+
+    if (start < 0 || end <= start) {
+        throw new Error("模型没有返回 JSON 总结。");
+    }
+
+    return JSON.parse(candidate.slice(start, end + 1));
+}
+
+/**
+ * 把总结对象整理成可导出的文本。
+ */
+function formatSummaryForExport(review) {
+    const parts = [
+        String(review.stage_summary || "").trim()
+    ];
+
+    const groups = [
+        ["关键要点", review.key_points],
+        ["术语 / 公式", review.terms],
+        ["待复习", review.review_questions]
+    ];
+
+    for (const [title, values] of groups) {
+        if (!Array.isArray(values) || values.length === 0) {
+            continue;
+        }
+
+        parts.push("");
+        parts.push(`${title}:`);
+
+        values
+            .slice(0, SUMMARY_MAX_LIST_ITEMS)
+            .forEach((value) => {
+                parts.push(`- ${String(value)}`);
+            });
+    }
+
+    return parts.join("\n").trim();
+}
+
+function renderSummaryReview(review) {
+    summaryCurrentReview = review;
+    sessionData.summary = formatSummaryForExport(review);
+
+    summaryContent.replaceChildren();
+
+    summaryContent.append(
+        createSummaryElement(
+            "p",
+            "stage-summary",
+            String(
+                review.stage_summary ||
+                "本阶段暂无可提炼的连续主题。"
+            )
+        )
+    );
+
+    const groups = [
+        ["关键要点", review.key_points],
+        ["术语 / 公式", review.terms],
+        ["待复习", review.review_questions]
+    ];
+
+    for (const [title, values] of groups) {
+        if (!Array.isArray(values) || values.length === 0) {
+            continue;
+        }
+
+        const block = createSummaryElement("div", "summary-group");
+        block.append(createSummaryElement("h4", null, title));
+
+        const list = createSummaryElement("ul");
+
+        values
+            .slice(0, SUMMARY_MAX_LIST_ITEMS)
+            .forEach((value) => {
+                list.append(
+                    createSummaryElement("li", null, String(value))
+                );
+            });
+
+        block.append(list);
+        summaryContent.append(block);
+    }
+}
+
+function buildSummarySystemPrompt() {
+    return (
+        "You are HearReview, a precise lecture study assistant. " +
+        "Summarize only what appears in the confirmed lecture " +
+        "transcript. The transcript may be English; answer in concise " +
+        "Chinese, retaining important English technical terms. Do not " +
+        "invent facts. Return strict JSON only with this schema: " +
+        '{"stage_summary":"1-2 sentences","key_points":["..."],' +
+        '"terms":["..."],"review_questions":["..."]}. ' +
+        `Use at most ${SUMMARY_MAX_LIST_ITEMS} entries per array.`
+    );
+}
+
+async function requestSummaryFromLlm(transcript) {
+    const provider = summaryProviderInput.value;
+    const model = summaryModelInput.value.trim();
+    const apiKey = summaryApiKeyInput.value.trim();
+
+    if (!model) {
+        throw new Error("请填写模型名称。");
+    }
+
+    if (provider !== "ollama" && !apiKey) {
+        throw new Error("请填写 API Key。");
+    }
+
+    const messages = [
+        { role: "system", content: buildSummarySystemPrompt() },
+        {
+            role: "user",
+            content: `Confirmed transcript:\n${transcript}`
+        }
+    ];
+
+    if (provider === "ollama") {
+        const response = await fetch(
+            "http://127.0.0.1:11434/api/chat",
+            {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    model,
+                    messages,
+                    stream: false,
+                    format: "json",
+                    options: { temperature: 0.2 }
+                })
+            }
+        );
+
+        if (!response.ok) {
+            throw new Error(
+                "无法连接 Ollama；请确认已启动且已下载模型。\n" +
+                await response.text()
+            );
+        }
+
+        const data = await response.json();
+
+        return extractSummaryJson(
+            data.message?.content || ""
+        );
+    }
+
+    const endpoint =
+        summaryEndpointInput.value.trim() ||
+        (
+            provider === "deepseek"
+                ? "https://api.deepseek.com/chat/completions"
+                : ""
+        );
+
+    if (!endpoint) {
+        throw new Error("请填写接口地址。");
+    }
+
+    const response = await fetch(endpoint, {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${apiKey}`
+        },
+        body: JSON.stringify({
+            model,
+            messages,
+            temperature: 0.2,
+            response_format: { type: "json_object" }
+        })
+    });
+
+    if (!response.ok) {
+        throw new Error(
+            `LLM 请求失败 (${response.status})：` +
+            await response.text()
+        );
+    }
+
+    const data = await response.json();
+
+    return extractSummaryJson(
+        data.choices?.[0]?.message?.content || ""
+    );
+}
+
+/**
+ * 生成一次课堂要点。
+ *
+ * automatic 为 true 时表示由字幕更新触发，
+ * 此时失败只更新状态，不覆盖面板内容。
+ */
+async function generateSummary(automatic = false) {
+    const transcript = getConfirmedTranscriptText();
+
+    if (summaryIsGenerating || !transcript) {
+        if (!transcript && !automatic) {
+            setSummaryState("等待确认字幕", "idle");
+        }
+
+        return;
+    }
+
+    /*
+     * 记录本次请求对应的字符数。
+     * 请求期间新到的字幕会在下一次触发时计算。
+     */
+    const characterCount = getConfirmedCharacterCount();
+
+    summaryIsGenerating = true;
+
+    /*
+     * 无论成功或失败都记录请求时间，
+     * 避免 LLM 不可用时被高频重试。
+     */
+    summaryLastRequestedAt = Date.now();
+    setSummaryState("正在生成…", "working");
+
+    try {
+        renderSummaryReview(
+            await requestSummaryFromLlm(transcript)
+        );
+
+        summarySummarizedCharacters = characterCount;
+        setSummaryState("已更新", "ready");
+    } catch (error) {
+        console.warn("课堂总结失败：", error);
+        setSummaryState("服务未连接", "error");
+
+        if (!automatic) {
+            summaryContent.replaceChildren(
+                createSummaryElement(
+                    "p",
+                    "summary-placeholder",
+                    error.message
+                )
+            );
+        }
+    } finally {
+        summaryIsGenerating = false;
+    }
+}
+
+/**
+ * 字幕更新后判断是否达到自动生成条件。
+ */
+function maybeAutoGenerateSummary() {
+    const totalCharacters = getConfirmedCharacterCount();
+
+    const newCharacters =
+        totalCharacters - summarySummarizedCharacters;
+
+    if (newCharacters < SUMMARY_MIN_NEW_CHARACTERS) {
+        return;
+    }
+
+    if (
+        Date.now() - summaryLastRequestedAt <
+        SUMMARY_MIN_INTERVAL_MS
+    ) {
+        return;
+    }
+
+    void generateSummary(true);
+}
+
+/**
+ * 开始新课堂时重置要点面板。
+ */
+function resetSummaryPanel() {
+    summaryCurrentReview = null;
+    summarySummarizedCharacters = 0;
+    summaryLastRequestedAt = 0;
+    summaryIsGenerating = false;
+
+    sessionData.summary = null;
+
+    summaryContent.replaceChildren(
+        createSummaryElement(
+            "p",
+            "summary-placeholder",
+            "连接 LLM 后，这里会持续显示本阶段重点。"
+        )
+    );
+
+    setSummaryState("等待确认字幕", "idle");
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1289,6 +1801,7 @@ async function startSession() {
 
     clearTranscriptDisplay();
     resetLagDisplay();
+    resetSummaryPanel();
 
     try {
         await connectWebSocket();
@@ -1514,6 +2027,34 @@ downloadJsonButton.addEventListener(
     downloadJsonTranscript
 );
 
+summaryNowButton.addEventListener("click", () => {
+    void generateSummary();
+});
+
+summarySettingsButton.addEventListener("click", () => {
+    summarySettingsForm.hidden = !summarySettingsForm.hidden;
+});
+
+summaryCloseSettingsButton.addEventListener("click", () => {
+    summarySettingsForm.hidden = true;
+});
+
+summaryProviderInput.addEventListener(
+    "change",
+    updateSummaryProviderFields
+);
+
+summarySettingsForm.addEventListener(
+    "submit",
+    async (event) => {
+        event.preventDefault();
+
+        saveSummarySettings();
+
+        await generateSummary();
+    }
+);
+
 refreshDevicesButton.addEventListener(
     "click",
     async () => {
@@ -1605,6 +2146,7 @@ async function initializeApplication() {
 
     resetLagDisplay();
     updateVolumeDisplay(0);
+    initializeSummaryPanel();
 
     sessionTime.textContent = "00:00:00";
     setServerStatus("未连接", "idle");

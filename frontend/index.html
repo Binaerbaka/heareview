@@ -94,6 +94,53 @@
         </section>
 
         <aside class="information-panel">
+            <section class="info-card summary-card">
+                <div class="summary-heading">
+                    <h3>实时课堂要点</h3>
+                    <span id="summary-state" class="summary-state is-idle">尚未配置</span>
+                </div>
+
+                <p class="summary-hint">基于已确认字幕生成，不影响实时转录。</p>
+
+                <div id="summary-content" class="summary-content">
+                    <p class="summary-placeholder">连接 LLM 后，这里会持续显示本阶段重点。</p>
+                </div>
+
+                <div class="summary-actions">
+                    <button id="summary-now-button" type="button">生成当前总结</button>
+                    <button id="summary-settings-button" class="subtle-button" type="button">LLM 设置</button>
+                </div>
+
+                <form id="summary-settings" class="summary-settings" hidden>
+                    <label>服务提供商
+                        <select id="summary-provider">
+                            <option value="ollama">Ollama（本机、免费）</option>
+                            <option value="deepseek">DeepSeek API</option>
+                            <option value="openai-compatible">OpenAI-compatible API</option>
+                        </select>
+                    </label>
+
+                    <label>模型
+                        <input id="summary-model" required autocomplete="off">
+                    </label>
+
+                    <label id="summary-endpoint-row">接口地址
+                        <input id="summary-endpoint" placeholder="留空使用服务默认地址" autocomplete="url">
+                    </label>
+
+                    <label id="summary-key-row">API Key
+                        <input id="summary-api-key" type="password" placeholder="仅保留在当前页面，不会写入本机存储" autocomplete="off">
+                    </label>
+
+                    <p id="summary-provider-note" class="summary-provider-note"></p>
+
+                    <div class="summary-settings-actions">
+                        <button type="submit">保存并测试</button>
+                        <button id="summary-close-settings" class="subtle-button" type="button">关闭</button>
+                    </div>
+                </form>
+            </section>
+
             <section class="info-card">
                 <h3>处理状态</h3>
 
@@ -115,7 +162,7 @@
 
             <section class="info-card">
                 <h3>当前版本</h3>
-                <p>HearReview v0.5</p>
+                <p>HearReview v0.6</p>
                 <p>WhisperLiveKit + SimulStreaming</p>
             </section>
 

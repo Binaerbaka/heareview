@@ -359,3 +359,139 @@ button:disabled {
     color: var(--text);
     border: 1px solid var(--border);
 }
+
+/* -------------------------------------------------------------------------- */
+/* 实时课堂要点（v0.6）                                                        */
+/* -------------------------------------------------------------------------- */
+
+.summary-heading,
+.summary-actions,
+.summary-settings-actions {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+}
+
+.summary-heading h3 {
+    margin: 0;
+}
+
+.summary-state {
+    padding: 4px 7px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 700;
+}
+
+.summary-state.is-idle {
+    color: var(--muted);
+    background: rgb(147 164 199 / 12%);
+}
+
+.summary-state.is-working {
+    color: #ffd166;
+    background: rgb(255 209 102 / 12%);
+}
+
+.summary-state.is-ready {
+    color: var(--success);
+    background: rgb(72 213 151 / 12%);
+}
+
+.summary-state.is-error {
+    color: var(--danger);
+    background: rgb(255 107 122 / 12%);
+}
+
+.summary-hint,
+.summary-provider-note {
+    margin: 8px 0;
+    color: var(--muted);
+    font-size: 12px;
+    line-height: 1.45;
+}
+
+.summary-content {
+    max-height: 340px;
+    overflow: auto;
+    font-size: 13px;
+    line-height: 1.55;
+}
+
+.summary-placeholder {
+    color: var(--muted);
+}
+
+.stage-summary {
+    margin: 0 0 10px;
+    color: var(--text);
+}
+
+.summary-group {
+    padding-top: 8px;
+    border-top: 1px solid var(--border);
+}
+
+.summary-group h4 {
+    margin: 0 0 5px;
+    font-size: 12px;
+    color: var(--accent);
+}
+
+.summary-group ul {
+    margin: 0;
+    padding-left: 18px;
+    color: var(--muted);
+}
+
+.summary-group li {
+    margin: 3px 0;
+}
+
+.summary-actions {
+    margin-top: 12px;
+}
+
+.summary-actions button,
+.summary-settings-actions button {
+    padding: 7px 9px;
+    font-size: 12px;
+}
+
+.subtle-button {
+    color: var(--text);
+    background: var(--panel-light);
+    border: 1px solid var(--border);
+}
+
+.summary-settings {
+    display: grid;
+    gap: 9px;
+    margin-top: 12px;
+    padding-top: 12px;
+    border-top: 1px solid var(--border);
+}
+
+.summary-settings label {
+    display: grid;
+    gap: 4px;
+    color: var(--muted);
+    font-size: 12px;
+}
+
+.summary-settings input,
+.summary-settings select {
+    width: 100%;
+    padding: 8px;
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    outline: 0;
+    color: var(--text);
+    background: var(--panel-light);
+}
+
+.summary-settings input:focus,
+.summary-settings select:focus {
+    border-color: var(--accent);
+}

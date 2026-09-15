@@ -8,7 +8,8 @@
 - 流式识别（WhisperLiveKit + SimulStreaming）
 - 已确认字幕（`lines`）固定向下显示，临时字幕（`buffer_transcription`）在底部实时变化
 - 显示转录 / 确认策略 / 模型处理积压时间
-- 保存并下载全部原始 JSON
+- 实时课堂要点：基于已确认字幕调用 LLM 生成阶段总结（Ollama / DeepSeek / OpenAI-compatible）
+- 下载字幕（Markdown）与原始 JSON，导出包含课堂总结
 - 同时保存完整课堂录音（WAV）
 
 ## 环境要求
@@ -32,6 +33,19 @@ powershell -ExecutionPolicy Bypass -File .\start_server.ps1
 在浏览器中打开 `frontend/index.html`，点击“开始课堂”授权麦克风即可。
 
 > 若浏览器因安全策略拒绝麦克风，请改用本地静态服务器打开前端。
+
+### 3. 配置实时课堂要点（可选）
+
+在右侧“实时课堂要点”面板点击“LLM 设置”，选择服务、模型与 Key 后“保存并测试”。
+
+| 提供商 | 填写内容 | 默认模型 |
+| --- | --- | --- |
+| Ollama | 不填 Key 和地址 | `qwen2.5:7b` |
+| DeepSeek | Key；地址可留空 | `deepseek-chat` |
+| OpenAI-compatible | Key、完整 Chat Completions 地址 | 按服务填写 |
+
+新增约 420 个已确认字符且距上次总结至少 45 秒时自动更新，也可手动“生成当前总结”。
+API Key 只保留在当前页面，不会写入本机存储、导出文件或字幕；未配置时原有字幕功能不受影响。
 
 ### 命令行版本（v0.4，旧）
 
