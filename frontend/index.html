@@ -95,6 +95,24 @@
                 <div class="summary-actions">
                     <button id="summary-now-button" type="button">生成当前总结</button>
                 </div>
+
+                <!-- 课堂结束后按需生成完整复习资料。 -->
+                <section class="final-review-panel">
+                    <div class="summary-heading">
+                        <div>
+                            <h3>最终 Review</h3>
+                            <p class="summary-hint">课堂结束后，按需生成完整复习资料。</p>
+                        </div>
+
+                        <span id="final-review-state" class="summary-state is-idle">等待课堂结束</span>
+                    </div>
+
+                    <div class="summary-actions">
+                        <button id="final-review-button" type="button" disabled>生成最终 Review</button>
+                    </div>
+
+                    <div id="final-review-content" class="final-review-content" hidden></div>
+                </section>
             </section>
         </section>
 
@@ -214,7 +232,7 @@
 
             <section class="info-card">
                 <h3>当前版本</h3>
-                <p>HearReview v0.6.3</p>
+                <p>HearReview v0.7.0</p>
                 <p>WhisperLiveKit + SimulStreaming</p>
             </section>
         </aside>

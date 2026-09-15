@@ -1,7 +1,7 @@
 "use strict";
 
 /*
- * HearReview v0.6.3
+ * HearReview v0.7.0
  *
  * 设计目标：
  * 1. 长时间课堂中不保存音频，控制内存和磁盘占用。
@@ -12,7 +12,7 @@
  * 6. 基于已确认字幕实时生成课堂要点（v0.6）。
  */
 
-const APP_VERSION = "HearReview v0.6.3";
+const APP_VERSION = "HearReview v0.7.0";
 const TARGET_SAMPLE_RATE = 16000;
 const DEBUG_EVENT_LIMIT = 100;
 const STOP_TIMEOUT_MS = 15000;
@@ -42,6 +42,16 @@ const PARTIAL_TRANSLATION_DEBOUNCE_MS = 1000;
 const PARTIAL_TRANSLATION_MAX_WAIT_MS = 3000;
 const PARTIAL_TRANSLATION_MIN_INTERVAL_MS = 1000;
 const PARTIAL_TRANSLATION_SOURCE_LIMIT = 800;
+
+/*
+ * 最终 Review 的分段阈值。
+ *
+ * 字幕较短时一次请求完整生成；
+ * 超过 SINGLE_LIMIT 时按时间顺序切成 CHUNK_SIZE 的多个分块，
+ * 先逐块生成阶段分析，再做一次合并，避免长课堂丢失前半段。
+ */
+const FINAL_REVIEW_SINGLE_LIMIT = 24000;
+const FINAL_REVIEW_CHUNK_SIZE = 12000;
 
 /*
  * 两次翻译请求之间的最小间隔。
@@ -104,6 +114,9 @@ const summaryProviderNote = requireElement("summary-provider-note");
 const summaryNowButton = requireElement("summary-now-button");
 const summarySettingsButton = requireElement("summary-settings-button");
 const summaryCloseSettingsButton = requireElement("summary-close-settings");
+const finalReviewButton = requireElement("final-review-button");
+const finalReviewState = requireElement("final-review-state");
+const finalReviewContent = requireElement("final-review-content");
 const appLayout = requireElement("app-layout");
 const sidebarResizer = requireElement("sidebar-resizer");
 const summaryResizer = requireElement("summary-resizer");
@@ -168,6 +181,15 @@ let summaryIsGenerating = false;
 let summaryLastRequestedAt = 0;
 let summarySummarizedCharacters = 0;
 let summaryCurrentReview = null;
+let finalReviewIsGenerating = false;
+
+/*
+ * 所有 LLM 请求（课堂要点 / 字幕翻译 / 最终 Review）共享一个串行队列，
+ * 保证同一时刻只有一个请求在飞，排队而不是丢弃。
+ */
+const llmRequestQueue = [];
+let llmRequestRunning = false;
+
 let translationEnabled = false;
 let translationTimer = null;
 let translationRequestInFlight = false;
@@ -222,6 +244,7 @@ function createEmptySession() {
         duration_seconds: 0,
         confirmed_lines: [],
         summary: null,
+        final_review: null,
         statistics: {
             max_transcription_lag: 0,
             max_policy_lag: 0,
@@ -1091,7 +1114,48 @@ function buildSummarySystemPrompt() {
     );
 }
 
-async function requestSummaryFromLlm(transcript) {
+/**
+ * 把任务排入共享 LLM 队列。
+ *
+ * 队列串行执行，同一时刻只有一个请求在飞；
+ * 请求会被排队而不是丢弃。
+ */
+function enqueueLlmRequest(task) {
+    return new Promise((resolve, reject) => {
+        llmRequestQueue.push({ task, resolve, reject });
+        void processLlmRequestQueue();
+    });
+}
+
+async function processLlmRequestQueue() {
+    if (llmRequestRunning) {
+        return;
+    }
+
+    llmRequestRunning = true;
+
+    try {
+        while (llmRequestQueue.length > 0) {
+            const entry = llmRequestQueue.shift();
+
+            try {
+                entry.resolve(await entry.task());
+            } catch (error) {
+                entry.reject(error);
+            }
+        }
+    } finally {
+        llmRequestRunning = false;
+    }
+}
+
+/**
+ * 通用 LLM JSON 请求。
+ *
+ * 读取当前 LLM 设置，按提供商发起请求并解析 JSON 对象。
+ * 课堂要点、字幕翻译、最终 Review 都通过它，统一排队。
+ */
+async function requestLlmJson(messages, temperature = 0.2) {
     const provider = summaryProviderInput.value;
     const model = summaryModelInput.value.trim();
     const apiKey = summaryApiKeyInput.value.trim();
@@ -1104,14 +1168,28 @@ async function requestSummaryFromLlm(transcript) {
         throw new Error("请填写 API Key。");
     }
 
-    const messages = [
-        { role: "system", content: buildSummarySystemPrompt() },
-        {
-            role: "user",
-            content: `Confirmed transcript:\n${transcript}`
-        }
-    ];
+    const endpoint = summaryEndpointInput.value.trim();
 
+    return enqueueLlmRequest(() =>
+        performLlmJsonRequest({
+            provider,
+            model,
+            apiKey,
+            endpoint,
+            messages,
+            temperature
+        })
+    );
+}
+
+async function performLlmJsonRequest({
+    provider,
+    model,
+    apiKey,
+    endpoint,
+    messages,
+    temperature
+}) {
     if (provider === "ollama") {
         const response = await fetch(
             "http://127.0.0.1:11434/api/chat",
@@ -1123,7 +1201,7 @@ async function requestSummaryFromLlm(transcript) {
                     messages,
                     stream: false,
                     format: "json",
-                    options: { temperature: 0.2 }
+                    options: { temperature }
                 })
             }
         );
@@ -1142,19 +1220,19 @@ async function requestSummaryFromLlm(transcript) {
         );
     }
 
-    const endpoint =
-        summaryEndpointInput.value.trim() ||
+    const resolvedEndpoint =
+        endpoint ||
         (
             provider === "deepseek"
                 ? "https://api.deepseek.com/chat/completions"
                 : ""
         );
 
-    if (!endpoint) {
+    if (!resolvedEndpoint) {
         throw new Error("请填写接口地址。");
     }
 
-    const response = await fetch(endpoint, {
+    const response = await fetch(resolvedEndpoint, {
         method: "POST",
         headers: {
             "Content-Type": "application/json",
@@ -1163,7 +1241,7 @@ async function requestSummaryFromLlm(transcript) {
         body: JSON.stringify({
             model,
             messages,
-            temperature: 0.2,
+            temperature,
             response_format: { type: "json_object" }
         })
     });
@@ -1180,6 +1258,16 @@ async function requestSummaryFromLlm(transcript) {
     return extractSummaryJson(
         data.choices?.[0]?.message?.content || ""
     );
+}
+
+async function requestSummaryFromLlm(transcript) {
+    return requestLlmJson([
+        { role: "system", content: buildSummarySystemPrompt() },
+        {
+            role: "user",
+            content: `Confirmed transcript:\n${transcript}`
+        }
+    ]);
 }
 
 /**
@@ -1236,6 +1324,289 @@ async function generateSummary(automatic = false) {
         }
     } finally {
         summaryIsGenerating = false;
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/* 最终 Review（v0.7.0）                                                       */
+/* -------------------------------------------------------------------------- */
+
+function setFinalReviewState(text, tone = "idle") {
+    finalReviewState.textContent = text;
+    finalReviewState.className = `summary-state is-${tone}`;
+}
+
+/**
+ * 把最终 Review 整理成可导出的 Markdown 文本。
+ */
+function formatFinalReviewForExport(review) {
+    const parts = [String(review.overview || "").trim()];
+
+    const groups = [
+        ["核心概念", review.core_concepts],
+        ["反复强调的重点", review.repeated_emphases],
+        ["专业术语", review.terminology],
+        ["易混淆点", review.confusion_points]
+    ];
+
+    for (const [title, values] of groups) {
+        if (!Array.isArray(values) || values.length === 0) {
+            continue;
+        }
+
+        parts.push("");
+        parts.push(`### ${title}`);
+
+        values.forEach((item) => {
+            parts.push(
+                `- ${typeof item === "string"
+                    ? item
+                    : JSON.stringify(item)}`
+            );
+        });
+    }
+
+    return parts.join("\n").trim();
+}
+
+function renderFinalReview(review) {
+    sessionData.final_review = review;
+    finalReviewContent.replaceChildren();
+
+    const overview = String(review.overview || "").trim();
+
+    if (overview) {
+        finalReviewContent.append(
+            createSummaryElement(
+                "p",
+                "final-review-overview",
+                overview
+            )
+        );
+    }
+
+    const groups = [
+        ["核心概念", review.core_concepts],
+        ["老师反复强调的重点", review.repeated_emphases],
+        ["专业术语", review.terminology],
+        ["易混淆点", review.confusion_points]
+    ];
+
+    for (const [title, values] of groups) {
+        if (!Array.isArray(values)) {
+            continue;
+        }
+
+        const items = values.filter(Boolean);
+
+        if (items.length === 0) {
+            continue;
+        }
+
+        const block = createSummaryElement(
+            "section",
+            "final-review-group"
+        );
+
+        block.append(createSummaryElement("h4", null, title));
+
+        const list = createSummaryElement("ul");
+
+        items.forEach((value) => {
+            list.append(
+                createSummaryElement(
+                    "li",
+                    null,
+                    typeof value === "string"
+                        ? value
+                        : JSON.stringify(value)
+                )
+            );
+        });
+
+        block.append(list);
+        finalReviewContent.append(block);
+    }
+
+    finalReviewContent.hidden = false;
+}
+
+function buildFinalReviewPrompt() {
+    return (
+        "You are HearReview. Analyze the full confirmed lecture " +
+        "transcript in concise Chinese. Return strict JSON only: " +
+        '{"overview":"...","core_concepts":["concept | Level 1-5 | ' +
+        'explanation"],"repeated_emphases":["concept | count | ' +
+        'timestamps if visible | why important"],"terminology":' +
+        '["English term | Chinese | definition | Level 1-5"],' +
+        '"confusion_points":["..."]}. Count repeated concepts ' +
+        "semantically, not only exact wording. Do not invent facts " +
+        "or generate exercises/questions."
+    );
+}
+
+function buildStageAnalysisPrompt(partNumber, partCount) {
+    return (
+        `You are HearReview. This is part ${partNumber} of ` +
+        `${partCount} of a confirmed lecture transcript. Analyze ` +
+        "only this part in concise Chinese. Return strict JSON only: " +
+        '{"segment_summary":"1-2 sentences","core_concepts":' +
+        '["concept | Level 1-5 | explanation"],"repeated_emphases":' +
+        '["concept | count in this part | timestamps if visible | ' +
+        'why important"],"terminology":["English term | Chinese | ' +
+        'definition | Level 1-5"],"confusion_points":["..."]}. ' +
+        "Count repeated concepts semantically, not only exact " +
+        "wording. Do not invent facts."
+    );
+}
+
+function buildFinalReviewMergePrompt() {
+    return (
+        "You are HearReview. You are given ordered stage analyses " +
+        "of one full lecture. Merge them into a single final review " +
+        "in concise Chinese. Return strict JSON only: " +
+        '{"overview":"...","core_concepts":["concept | Level 1-5 | ' +
+        'explanation"],"repeated_emphases":["concept | total count | ' +
+        'timestamps if visible | why important"],"terminology":' +
+        '["English term | Chinese | definition | Level 1-5"],' +
+        '"confusion_points":["..."]}. Merge duplicates and sum ' +
+        "counts across stages. Preserve important content from every " +
+        "stage; do not drop the beginning. Do not invent facts or " +
+        "generate exercises/questions."
+    );
+}
+
+function buildFinalReviewTranscript() {
+    return sessionData.confirmed_lines
+        .map((line) => `[${line.start || ""}] ${line.text}`)
+        .join("\n");
+}
+
+/**
+ * 按时间顺序把字幕切成多个分块。
+ *
+ * 逐行累加，尽量保持原有顺序，不在句子中间随意切断。
+ */
+function splitTranscriptForReview(transcript, chunkSize) {
+    const lines = transcript.split("\n");
+    const chunks = [];
+    let current = "";
+
+    for (const line of lines) {
+        if (current && current.length + line.length + 1 > chunkSize) {
+            chunks.push(current);
+            current = "";
+        }
+
+        current = current ? `${current}\n${line}` : line;
+    }
+
+    if (current) {
+        chunks.push(current);
+    }
+
+    return chunks;
+}
+
+function buildFinalReviewMessages(transcript) {
+    return [
+        { role: "system", content: buildFinalReviewPrompt() },
+        {
+            role: "user",
+            content: `Confirmed transcript:\n${transcript}`
+        }
+    ];
+}
+
+function buildStageAnalysisMessages(chunk, partNumber, partCount) {
+    return [
+        {
+            role: "system",
+            content: buildStageAnalysisPrompt(partNumber, partCount)
+        },
+        {
+            role: "user",
+            content:
+                `Confirmed transcript (part ${partNumber}/` +
+                `${partCount}):\n${chunk}`
+        }
+    ];
+}
+
+function buildFinalReviewMergeMessages(stageAnalyses) {
+    return [
+        { role: "system", content: buildFinalReviewMergePrompt() },
+        { role: "user", content: JSON.stringify(stageAnalyses) }
+    ];
+}
+
+/**
+ * 长课堂：逐块生成阶段分析，再合并为最终 Review。
+ */
+async function generateChunkedFinalReview(transcript) {
+    const chunks = splitTranscriptForReview(
+        transcript,
+        FINAL_REVIEW_CHUNK_SIZE
+    );
+
+    const stageAnalyses = [];
+
+    for (let index = 0; index < chunks.length; index += 1) {
+        setFinalReviewState(
+            `正在分析第 ${index + 1}/${chunks.length} 段…`,
+            "working"
+        );
+
+        stageAnalyses.push(
+            await requestLlmJson(
+                buildStageAnalysisMessages(
+                    chunks[index],
+                    index + 1,
+                    chunks.length
+                )
+            )
+        );
+    }
+
+    setFinalReviewState("正在合并各段分析…", "working");
+
+    return requestLlmJson(
+        buildFinalReviewMergeMessages(stageAnalyses)
+    );
+}
+
+async function generateFinalReview() {
+    if (
+        finalReviewIsGenerating ||
+        sessionData.confirmed_lines.length === 0
+    ) {
+        return;
+    }
+
+    const transcript = buildFinalReviewTranscript();
+
+    finalReviewIsGenerating = true;
+    finalReviewButton.disabled = true;
+    setFinalReviewState("正在生成…", "working");
+
+    try {
+        const review =
+            transcript.length <= FINAL_REVIEW_SINGLE_LIMIT
+                ? await requestLlmJson(
+                    buildFinalReviewMessages(transcript)
+                )
+                : await generateChunkedFinalReview(transcript);
+
+        renderFinalReview(review);
+        setFinalReviewState("已生成", "ready");
+        finalReviewButton.textContent = "重新生成最终 Review";
+    } catch (error) {
+        console.warn("最终 Review 生成失败：", error);
+        setFinalReviewState("生成失败", "error");
+    } finally {
+        finalReviewIsGenerating = false;
+        finalReviewButton.disabled =
+            sessionData.confirmed_lines.length === 0;
     }
 }
 
@@ -1343,34 +1714,12 @@ function buildTranslationPrompt(items) {
 }
 
 async function requestTranslationFromLlm(items) {
-    const provider = summaryProviderInput.value;
-    const model = summaryModelInput.value.trim();
-    const apiKey = summaryApiKeyInput.value.trim();
-    if (!model || (provider !== "ollama" && !apiKey)) {
-        throw new Error("请先在 LLM 设置中填写可用的模型和 API Key。");
-    }
-    const messages = buildTranslationPrompt(items);
-    let response;
-    if (provider === "ollama") {
-        response = await fetch("http://127.0.0.1:11434/api/chat", {
-            method: "POST", headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ model, messages, stream: false, format: "json", options: { temperature: 0.1 } })
-        });
-        if (!response.ok) throw new Error(await response.text());
-        const data = await response.json();
-        return extractSummaryJson(data.message?.content || "").translations;
-    }
-    const endpoint = summaryEndpointInput.value.trim() ||
-        (provider === "deepseek" ? "https://api.deepseek.com/chat/completions" : "");
-    if (!endpoint) throw new Error("请填写接口地址。");
-    response = await fetch(endpoint, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-        body: JSON.stringify({ model, messages, temperature: 0.1, response_format: { type: "json_object" } })
-    });
-    if (!response.ok) throw new Error(await response.text());
-    const data = await response.json();
-    return extractSummaryJson(data.choices?.[0]?.message?.content || "").translations;
+    const data = await requestLlmJson(
+        buildTranslationPrompt(items),
+        0.1
+    );
+
+    return data.translations;
 }
 
 /**
@@ -1423,18 +1772,9 @@ async function flushTranslations(lines) {
     if (items.length === 0) return;
 
     /*
-     * 与临时字幕翻译串行：
-     * 同一时刻只允许一个 LLM 请求。若临时翻译正在请求，
-     * 稍后重试，不丢失确认字幕的待翻译内容。
+     * 并发由共享 LLM 队列统一串行化，
+     * 这里不再需要针对另一类翻译做重试。
      */
-    if (partialTranslationInFlight) {
-        window.clearTimeout(translationTimer);
-        translationTimer = window.setTimeout(() => {
-            void flushTranslations(sessionData.confirmed_lines);
-        }, TRANSLATION_DEBOUNCE_MS);
-        return;
-    }
-
     const epoch = translationEpoch;
 
     translationRequestInFlight = true;
@@ -1611,17 +1951,8 @@ async function flushPartialTranslation(revision, text) {
     }
 
     /*
-     * 与确认字幕翻译串行：
-     * 同一时刻只允许一个 LLM 请求。若确认翻译正在请求，
-     * 稍后重试，不丢失本次待翻译内容。
+     * 并发由共享 LLM 队列统一串行化。
      */
-    if (translationRequestInFlight) {
-        window.clearTimeout(partialTranslationTimer);
-        partialTranslationTimer = window.setTimeout(() => {
-            void flushPartialTranslation(revision, text);
-        }, PARTIAL_TRANSLATION_DEBOUNCE_MS);
-        return;
-    }
 
     /*
      * 每次实际请求分配递增 requestId，
@@ -2351,6 +2682,17 @@ async function startSession() {
     refreshDevicesButton.disabled = true;
 
     sessionData = createEmptySession();
+
+    /*
+     * 新课堂重置最终 Review。
+     */
+    finalReviewContent.replaceChildren();
+    finalReviewContent.hidden = true;
+    finalReviewButton.disabled = true;
+    finalReviewButton.textContent = "生成最终 Review";
+    finalReviewIsGenerating = false;
+    setFinalReviewState("等待课堂结束", "idle");
+
     sessionData.course_name =
         courseNameInput.value.trim() || "Untitled Lecture";
     sessionData.started_at = new Date().toISOString();
@@ -2471,6 +2813,10 @@ async function stopSession() {
     microphoneSelect.disabled = false;
 
     updateDownloadButtons();
+
+    finalReviewButton.disabled =
+        sessionData.confirmed_lines.length === 0;
+    setFinalReviewState("可按需生成", "idle");
 }
 
 /* -------------------------------------------------------------------------- */
@@ -2520,6 +2866,15 @@ function createMarkdownTranscript() {
         lines.push("## Summary");
         lines.push("");
         lines.push(String(sessionData.summary));
+        lines.push("");
+    }
+
+    if (sessionData.final_review) {
+        lines.push("## Final Review");
+        lines.push("");
+        lines.push(
+            formatFinalReviewForExport(sessionData.final_review)
+        );
         lines.push("");
     }
 
@@ -2597,6 +2952,10 @@ downloadJsonButton.addEventListener(
 
 summaryNowButton.addEventListener("click", () => {
     void generateSummary();
+});
+
+finalReviewButton.addEventListener("click", () => {
+    void generateFinalReview();
 });
 
 summarySettingsButton.addEventListener("click", () => {

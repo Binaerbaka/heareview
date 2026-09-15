@@ -663,3 +663,42 @@ button:disabled {
         max-height: 45vh;
     }
 }
+
+/* -------------------------------------------------------------------------- */
+/* 最终 Review（v0.7.0）                                                       */
+/* -------------------------------------------------------------------------- */
+
+.final-review-panel {
+    margin-top: 20px;
+    padding-top: 16px;
+    border-top: 1px solid var(--border);
+}
+
+.final-review-content {
+    margin-top: 14px;
+    padding: 14px;
+    border-radius: 10px;
+    background: var(--panel-light);
+    font-size: 16px;
+    line-height: 1.65;
+}
+
+.final-review-overview {
+    margin: 0 0 12px;
+}
+
+.final-review-group + .final-review-group {
+    margin-top: 14px;
+    padding-top: 12px;
+    border-top: 1px solid var(--border);
+}
+
+.final-review-group h4 {
+    margin: 0 0 6px;
+    color: var(--accent);
+}
+
+.final-review-group ul {
+    margin: 0;
+    padding-left: 22px;
+}
